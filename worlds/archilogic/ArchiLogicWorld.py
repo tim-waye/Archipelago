@@ -29,7 +29,17 @@ class ArchiLogicWorld(World):
         # Step One: In order to calculate the critical paths for the multiworld and/or each player, we essentially need our
         # own version of the playthrough from the spoiler log. So we're going to copy how the Spoiler class does that.
         logging.info("Building Playthrough to calculate critical paths.")
-        prog_locations = {location for location in multiworld.get_filled_locations() if location.item.advancement}
+
+        # Need a set of locations holding progression items. We'll also keep a count of these items for later.
+        prog_locations = set()
+        item_counts: Counter[Tuple[str, int]] = Counter()
+        for loc in multiworld.get_filled_locations():
+            item_counts[(loc.item.name, loc.item.player)] += 1
+            if loc.item.advancement:
+                prog_locations.add(loc)
+        item_counts += Counter((i.name, i.player) for items in multiworld.precollected_items.values()
+                               for i in items if i.advancement)
+
         state_cache: List[Optional[CollectionState]] = [None]
         state = CollectionState(multiworld)
         sphere_candidates = set(prog_locations)
@@ -57,10 +67,6 @@ class ArchiLogicWorld(World):
                     raise RuntimeError("During playthrough generation, the game was determined to be unbeatable. "
                                        "Something went terribly wrong here. "
                                        f"Unreachable progression items: {sphere_candidates}")
-                else:
-                    # Unreachable locations might be useful for foolish hints in the future
-                    unreachable_locations = sphere_candidates
-                    break
 
         # Stage Two: prune spheres down to only the required locations.
         required_locations = {location for sphere in collection_spheres for location in sphere}
@@ -74,19 +80,7 @@ class ArchiLogicWorld(World):
                     required_locations.add(loc)
             sphere -= to_delete
 
-        # Stage Three: Check if precollected items are required
-        required_starting_items = set()
-        for precollected_items in multiworld.precollected_items.values():
-            for item in precollected_items.copy():
-                if not item.advancement:
-                    continue
-                logging.debug('Checking if %s (Player %d) is required to beat the game.', item.name, item.player)
-                test_state = multiworld.state.copy()
-                test_state.remove(item)
-                if not multiworld.can_beat_game(test_state, required_locations):
-                    required_starting_items.add(item)
-
-        # Stage Four: Repair any unintentional links that may have been made in step two.
+        # Stage Three: Repair any unintentional links that may have been made in step two.
         # One last forward collection iteration through the state.
         required_locations = {item for sphere in collection_spheres for item in sphere}
         state = CollectionState(multiworld)
@@ -155,9 +149,9 @@ class ArchiLogicWorld(World):
 
         # Also need to handle the edge case of items that have multiple copies with the same name.
         # How many copies of each item exist anywhere in the multiworld, starting inventory included.
-        item_counts = Counter((loc.item.name, loc.item.player) for loc in multiworld.get_filled_locations())
-        item_counts += Counter((i.name, i.player) for items in multiworld.precollected_items.values()
-                               for i in items if i.advancement)
+        # item_counts = Counter((loc.item.name, loc.item.player) for loc in multiworld.get_filled_locations())
+        # item_counts += Counter((i.name, i.player) for items in multiworld.precollected_items.values()
+        #                        for i in items if i.advancement)
         def is_multi_copy(item):
             """This item has multiple copies, but not enough to be treated as a bulk item"""
             return 1 < item_counts[(item.name, item.player)] <= cls.bulk_item_threshold
@@ -354,7 +348,6 @@ class ArchiLogicWorld(World):
                     and item.name not in multiworld.worlds[item.player].hint_blacklist)
 
         hintable_loc_reqs: Dict[Location, Set[Item]] = defaultdict(set)
-        hintable_copies: Dict[Item, Set[Optional[Location]]] = defaultdict(set)
         required_bulk: Set[Tuple[str, int]] = set()
         for loc, items in resolved_loc_necessary.items():
             for item in items:
@@ -368,14 +361,6 @@ class ArchiLogicWorld(World):
                     # For now, treat copies of one item as an either/or with each other.
                     continue
                 hintable_loc_reqs[loc].add(item)
-                hintable_copies[item].add(item.location)
-
-        # Which regions hold path-relevant items, for "this region has 3 things you need" hints.
-        hintable_items_by_region: Dict[Region, Counter[Item]] = defaultdict(Counter)
-        for item, copies in hintable_copies.items():
-            for copy in copies:
-                if copy is not None:        # None is a precollected copy — no region to name
-                    hintable_items_by_region[copy.parent_region][item] += 1
 
         # Locate which regions hold each copy of required bulk items.
         # Potentially useful for a bulk item hint like: "Need more Power Stars? Player X's Y region has 4 of them!"
@@ -397,57 +382,54 @@ class ArchiLogicWorld(World):
 
         # Function used to handle items that get renamed by an apworld when collected
         # An example is LTTP internally stores "Progressive Sword" as "Fighter's Sword" or "Master Sword"
+        stored_name_cache: Dict[Tuple[str, int], Optional[str]] = {}
+
         def stored_name(player, item):
-            state = CollectionState(multiworld)
-            before = Counter(state.prog_items[player])
-            state.collect(item, True)
-            after = state.prog_items[player]
-            changed = [k for k in after if after[k] > before.get(k, 0)]
-            return changed[0] if len(changed) == 1 else None
+            cache_key = (item.name, player)
+            if cache_key not in stored_name_cache:
+                probe = CollectionState(multiworld)
+                before = Counter(probe.prog_items[player])
+                probe.collect(item, True)
+                after = probe.prog_items[player]
+                changed = [k for k in after if after[k] > before.get(k, 0)]
+                stored_name_cache[cache_key] = changed[0] if len(changed) == 1 else None
+            return stored_name_cache[cache_key]
 
-        def goal_deps(player, final_state):
-            seeds = set()
-            for item in goal_items(player, final_state):
-                if item.is_event and item.location is not None:
-                    seeds.update(resolved_loc_reqs[item.location])
-                else:
-                    seeds.add(item)
-            return seeds
+        # Tests which locations, if any, are required to be accessible by the game's completion condition.
+        # Note: this is NOT the same as locations needing to be accessible in order to beat the game. This should only
+        # determine if a game's completion condition rule (an arbitrary function defined in the apworld) DIRECTLY
+        # enforces that some, or many locations are accessible.
+        # For example, a game could have its completion condition be "Player can access post-game area"
+        def goal_locking_locations(player, completed_state):
+            locations = list(multiworld.get_locations(player))
 
-        def goal_items(player, final_state):
-            items_for_player = items_by_name(player)  # name -> Item
-            found = set()
-            for name, item in items_for_player.items():
-                # Make sure we're using the right item name
-                key = name if name in final_state.prog_items[player] else stored_name(player, item)
+            access_rule_backup = [loc.access_rule for loc in locations]
+            try:
+                # Force shut every location at once and test the completion condition. If it still passes then we know
+                # it's not based on access rules, so we can get out of here.
+                for loc in locations:
+                    loc.access_rule = lambda state: False
+                if multiworld.completion_condition[player](completed_state):
+                    return set()
+            finally:
+                # Undo the forced access rules
+                for loc, rule in zip(locations, access_rule_backup):
+                    loc.access_rule = rule
 
-                # If it's not a prog item it can't be a goal item
-                count = final_state.prog_items[player].get(key, 0) if key else 0
-                if not count:
-                    continue
-
-                test_state = final_state.copy()
-                test_state.remove_item(key, player, count)
-                test_state.reachable_regions[player] = set()
-                test_state.blocked_connections[player] = set()
-                test_state.stale[player] = True
-                if not multiworld.completion_condition[player](test_state):
-                    found.add(item)
-            return found
-
-        def goal_locations(player, final_state):
-            found = set()
-            for loc in multiworld.get_locations(player):
-                original = loc.access_rule
+            # If we're still here then completion does rely on some set of locations being accessible.
+            # We'll repeat the test for individual locations and see which ones cause the condition to fail.
+            required_locs = set()
+            for loc in locations:
+                original_rule = loc.access_rule
                 loc.access_rule = lambda state: False
                 try:
-                    if not multiworld.completion_condition[player](final_state):
-                        found.add(loc)
+                    if not multiworld.completion_condition[player](completed_state):
+                        required_locs.add(loc)
                 finally:
-                    loc.access_rule = original
-            return found
+                    loc.access_rule = original_rule
+            return required_locs
 
-        def endpoint_items(player, final_state, deps):
+        def endpoint_items(player, final_state):
             """
             Finds which items directly lock and/or represent the win condition for this player's game.
             Three ways an item qualifies, checked in order:
@@ -456,84 +438,90 @@ class ArchiLogicWorld(World):
                  reads it directly
               3. it guards the nearest guarded entrance into a goal location's region
             """
-            goal_locs = goal_locations(player, final_state)
-
-            # two probes per dep:
+            # two probes per item:
             #   deep    - caches cleared, so reachability is recomputed (test 2)
             #   shallow - caches intact, so only rules reading prog_items directly flip.
             #             This is what separates `state.has(X)` gates from `can_reach(...)`
             #             gates, which otherwise flip for every item on the path.
-            probes = {}
-            probes_shallow = {}
-            for dep in deps:
-                key = (dep.name if dep.name in final_state.prog_items[player]
-                       else stored_name(player, dep))
+            deep_state_cache = {}
+            shallow_state_cache = {}
+            for item in items_by_name(player).values():
+                key = (item.name if item.name in final_state.prog_items[player]
+                       else stored_name(player, item))
                 count = final_state.prog_items[player].get(key, 0) if key else 0
                 if not count:
-                    logging.warning("ArchiLogic: %s (P%d, %s) has no prog_items entry; "
-                                    "excluded from endpoints.",
-                                    dep.name, player, multiworld.game[player])
                     continue
 
-                probe = final_state.copy()
-                probe.remove_item(key, player, count)
-                probe.reachable_regions[player] = set()
-                probe.blocked_connections[player] = set()
-                probe.stale[player] = True
-                probes[dep] = probe
+                state_minus_item = final_state.copy()
+                state_minus_item.remove_item(key, player, count)
+                state_minus_item.reachable_regions[player] = set()
+                state_minus_item.blocked_connections[player] = set()
+                state_minus_item.stale[player] = True
 
+                if multiworld.completion_condition[player](state_minus_item):
+                    # Game is still beatable without this item. Skip it
+                    continue
+
+                deep_state_cache[item] = state_minus_item
                 shallow = final_state.copy()
                 shallow.remove_item(key, player, count)
-                probes_shallow[dep] = shallow
+                shallow_state_cache[item] = shallow
 
-            deps = {d for d in deps if d in probes}
+            reqs_for_goal = set(deep_state_cache)
 
-            access_for_spot = {}
-            def flips(spot, dep):
-                if spot not in access_for_spot:
-                    access_for_spot[spot] = spot.access_rule(final_state)
-                return access_for_spot[spot] and not spot.access_rule(probes_shallow[dep])
+            gate_cache = {}
+            def item_opens_gate(spot, item):
+                if spot not in gate_cache:
+                    gate_cache[spot] = spot.access_rule(final_state)
+                return gate_cache[spot] and not spot.access_rule(shallow_state_cache[item])
 
-            found = set()
-            remaining = set()
+            found_endpoints = set()
+            remaining_candidates = set()
+            goal_locs = goal_locking_locations(player, final_state)
 
-            for dep in deps:
-                # 1. breaks a goal location's own rule
-                if any(flips(gl, dep) for gl in goal_locs):
-                    found.add(dep)
-                # 2. goal reads it directly (glocs empty => goal has no location component)
-                elif not goal_locs or all(gl.can_reach(probes[dep]) for gl in goal_locs):
-                    found.add(dep)
-                else:
-                    remaining.add(dep)
+            if not goal_locs:
+                # The goal does not depend on access rules, so the items are the only endpoints
+                found_endpoints = set(reqs_for_goal)
+            else:
+                for item in reqs_for_goal:
+                    # Item is required to access a goal location
+                    gates_a_goal_location = any(item_opens_gate(loc, item) for loc in goal_locs)
 
-            logging.info("P%d tests 1+2 caught: %s", player, sorted(i.name for i in found))
-            logging.info("P%d remaining:       %s", player, sorted(i.name for i in remaining))
+                    # Every goal location is still reachable without it, but completion condition is false
+                    # without the item. So we must have required locations AND required items.
+                    goal_reads_it = all(loc.can_reach(deep_state_cache[item]) for loc in goal_locs)
 
-            # 3. guards the nearest item-named gate into a goal region.
-            #    Walk back only through genuinely free connections; an entrance with a
-            #    rule that no item flips (e.g. `_can_get(...)`) is still a closed door —
-            #    it just names no item, so there's no endpoint to report there.
-            free_state = baseline
+                    if gates_a_goal_location or goal_reads_it:
+                        found_endpoints.add(item)
+                    else:
+                        remaining_candidates.add(item)
 
-            for gl in goal_locs:
-                seen, frontier = set(), [gl.parent_region]
-                while frontier:
-                    region = frontier.pop()
-                    if region is None or region in seen:
-                        continue
-                    seen.add(region)
-                    for entrance in region.entrances:
-                        guards = {d for d in remaining if flips(entrance, d)}
-                        if guards:
-                            found |= guards
-                        elif entrance.access_rule(free_state):
-                            frontier.append(entrance.parent_region)
+                # Now find the final entrance gating the end of the game. This gives us an endpoint instead of
+                # EVERY entrance along the way.
+                for gl in goal_locs:
+                    seen_regions = set()
+                    frontier = [gl.parent_region]
+                    while frontier:
+                        region = frontier.pop()
+                        if region is None or region in seen_regions:
+                            continue
+                        seen_regions.add(region)
+                        for entrance in region.entrances:
+                            gates = set()
+                            for candidate in remaining_candidates:
+                                if item_opens_gate(entrance, candidate):
+                                      gates.add(candidate)
+                            if gates:
+                                found_endpoints |= gates
+                            elif entrance.access_rule(baseline):
+                                frontier.append(entrance.parent_region)
 
-            logging.info("P%d after test 3:    %s", player, sorted(i.name for i in found))
+            logging.info("P%d tests 1+2 caught: %s", player, sorted(i.name for i in found_endpoints))
+            logging.info("P%d remaining:       %s", player, sorted(i.name for i in remaining_candidates))
+            logging.info("P%d after test 3:    %s", player, sorted(i.name for i in found_endpoints))
 
-            if not found or found == deps:
-                found = set(deps)
+            if not found_endpoints or found_endpoints == reqs_for_goal:
+                found_endpoints = set(reqs_for_goal)
 
             # 4. One last edge case.
             # If a game only has one single endpoint then paths are no different from standard WOTH hints.
@@ -544,24 +532,25 @@ class ArchiLogicWorld(World):
             # If your goal condition is "beat the end boss" then my hope is, if it's not represented by getting some
             # item, or checking some location, then HOPEFULLY it would be a "beat the end boss" event.
             # (I guess we'll see how that works out. But it sounds good for now)
-            seen = set()
-            while len(found) == 1:
-                item = next(iter(found))
-                if item in seen or item.location is None:
+            seen_endpoint_items = set()
+            while len(found_endpoints) == 1:
+                item = next(iter(found_endpoints))
+                if item in seen_endpoint_items or item.location is None:
                     break
-                seen.add(item)
-                deeper = {i for i in location_necessary.get(item.location, ())
-                          if i.is_event or is_hintable(i)}
+                seen_endpoint_items.add(item)
+                deeper = set()
+                for req in location_necessary.get(item.location, ()):
+                    if req.is_event or is_hintable(req):
+                        deeper.add(req)
                 deeper.discard(item)
                 if not deeper:
                     break
-                found = deeper
+                found_endpoints = deeper
 
-            logging.info("P%d endpoints:       %s", player, sorted(i.name for i in found))
-            return found
+            logging.info("P%d endpoints:       %s", player, sorted(i.name for i in found_endpoints))
+            return found_endpoints
 
         # Oh boy, finally time to build our paths!
-        goal_dependencies = {}
         player_endpoints = {}
         go_mode_items: Dict[int, Set[Item]] = {}
 
@@ -576,8 +565,7 @@ class ArchiLogicWorld(World):
         for player in multiworld.player_ids:
             if multiworld.game[player] == cls.game: continue
             paths[player] = {}
-            goal_dependencies[player] = goal_deps(player, state)
-            player_endpoints[player] = endpoint_items(player, state, goal_dependencies[player])
+            player_endpoints[player] = endpoint_items(player, state)
 
             # Each endpoint has its own path
             for endpoint in player_endpoints[player]:
