@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import time
 from typing import Dict, List, Optional, Set, Tuple
 from collections import Counter, defaultdict
@@ -9,22 +10,85 @@ from worlds.AutoWorld import World
 
 class ArchiLogicWorld(World):
     game = "ArchiLogic"
+    item_name_to_id: Dict[str, int] = {}
+    location_name_to_id: Dict[str, int] = {}
 
     # TODO make these overrideable from options in the yaml. Per game preferably
     bulk_item_threshold = 6
+    locks_too_much_threshold = 50
     hintable_item_classes = [
         ItemClassification.progression,
         ItemClassification.progression_skip_balancing,
         ItemClassification.progression_deprioritized_skip_balancing,
     ]
 
-    item_name_to_id: Dict[str, int] = {}
-    location_name_to_id: Dict[str, int] = {}
+    # Making the paths feel good and useful is going to be a bit of a tuning exercise. I've made a few features to
+    # filter what is eligible for path hints, but it's going to take some trial and error to figure out what's best.
+    # So I've but them behind these feature flags for now. Maybe in the future these will be configurable through
+    # the player yaml or something.
+
+    # Filters Items which are events off of paths. Events themselves aren't typically shuffled and are more part of
+    # the game's internal workings. We want paths to just hint towards actual items.
+    # Note: we still allow Events to be Endpoints, because these events are likely to be understood by players since
+    # they are the game's victory conditions. Things like "Final Boss Defeated", or "Final Level Completed".
+    filter_events = True
+
+    # If any endpoint doesn't have any path hintable requirements then drop that endpoint off the list of paths.
+    # Also captures which endpoints this happens to so they can be hinted in other ways if needed.
+    filter_empty_paths = True
+
+    # For each of a players paths, removes any other endpoints and their path reqs so that all paths don't just become
+    # nested within each other. The goal is for paths to focus on the unique requirements for its endpoint.
+    # This is inspired by DK64R's hint logic where things like level entry is assumed. Otherwise, every item in later
+    # levels would require the full path to the key that unlocked that level. Which isn't really helpful for solving
+    # the specific path/location requirements we're trying to give a hint for.
+    filter_other_endpoints = True
+
+    # If any game has a single endpoint after we calculate what solves its completion condition, we dig deeper into that
+    # endpoint's requirements until we have multiple at once, which we'll use as the game's endpoints instead.
+    # This is because some apworlds use a single item or event collected at the end of the game to trigger the
+    # completion condition. Some even have semi-artificial items meant to mark completion (Banana Hoard in DK64).
+    # But having a single endpoint defeats the purpose of path hints, because all required items will just be required
+    # for the same one path. Indistinguishable from WOTH hints and loses the extra info of path hints.
+    expand_single_endpoints = True
+
+    # Any item that has multiple copies with the same name, but not enough to be considered bulk, is treated as
+    # ineligible for path hints. This is because they are prone to creating either/or situations where we can't say for
+    # certain which copies of the item are strictly required for completing the path. There could be some more complex
+    # handling done here, but for now I'm just going to sidestep the issue until a later update.
+    filter_multi_copy_items = True
+
+    # If any items are forced early either within one game or the whole multiworld, exclude them from the paths
+    # These items are most likely forced early because they lock a large proportion of some game's locations. If one
+    # item locks most of the checks in a world, then it'll will practically always be required, probably will be on
+    # every path for that world, AND on every other player's path if ANY of their required items are in this world.
+    #
+    # An example of this is Dark Souls 3's Small Lothric Banner, which gates you from leaving the first area of the game.
+    # If we path hinted it, it'd be like saying "some items on all these paths are somewhere in the ~95% of DS3 that is
+    # behind the Small Lothric Banner."
+    # Which is not very helpful to anyone, we're better off just hinting by world at that point.
+    filter_forced_early = True
+
+    # If any one item locks too much of its own game, then leave it off of paths. This is configurable by setting the
+    # locks_too_much_threshold value. Anything locking more than that percentage of checks will be considered too much.
+    # The reasoning for this is the same as filter_forced_early, widely required items are likely to be found early,
+    # and don't provide much useful information for path hints.
+    filter_locks_too_much = True
 
     @classmethod
     def stage_pre_output(cls, multiworld):
         logging.info("Entered Stage Pre-Output for ArchiLogic.")
         t0 = time.perf_counter()
+
+        # Setup debug logging and json dumping
+        here: str = os.path.dirname(__file__)
+        run_dir = os.path.join(here, "analysis",
+                               f"{time.strftime('%Y%m%d-%H%M%S')}-seed{getattr(multiworld, 'seed', 'x')}")
+        os.makedirs(run_dir, exist_ok=True)
+
+        run_log = logging.FileHandler(os.path.join(run_dir, "archilogic.log"), encoding="utf-8")
+        run_log.setFormatter(logging.Formatter("%(levelname)s  %(message)s"))
+        logging.getLogger().addHandler(run_log)
 
         # Step One: In order to calculate the critical paths for the multiworld and/or each player, we essentially need our
         # own version of the playthrough from the spoiler log. So we're going to copy how the Spoiler class does that.
@@ -340,16 +404,24 @@ class ArchiLogicWorld(World):
                 either_or_regions[reg] = known_either_or_items
 
         # Step Five: Determine which items and location are worth giving hints for.
-        # We're actually going to do double duty here and also compile a list of bulk items and their regions for use
-        # in other potential hints.
+
+        def is_forced_early(item):
+            if not cls.filter_forced_early:
+                return False
+            return (item.name in multiworld.early_items.get(item.player, {})
+                    or item.name in multiworld.local_early_items.get(item.player, {}))
+
         def is_hintable(item):
-            return (not item.is_event
+            return ((not cls.filter_events or not item.is_event)
                     and (item.classification in cls.hintable_item_classes)
-                    and item.name not in multiworld.worlds[item.player].hint_blacklist)
+                    and item.name not in multiworld.worlds[item.player].hint_blacklist
+                    and not is_forced_early(item))
 
         hintable_loc_reqs: Dict[Location, Set[Item]] = defaultdict(set)
         required_bulk: Set[Tuple[str, int]] = set()
-        for loc, items in resolved_loc_necessary.items():
+
+        necessary_reqs = resolved_loc_necessary if cls.filter_events else location_necessary
+        for loc, items in necessary_reqs.items():
             for item in items:
                 if not is_hintable(item):
                     continue
@@ -357,10 +429,43 @@ class ArchiLogicWorld(World):
                     # Required bulk items may earn a region hint, tracked separately below.
                     required_bulk.add((item.name, item.player))
                     continue
-                if is_multi_copy(item):
+                if cls.filter_multi_copy_items and is_multi_copy(item):
                     # For now, treat copies of one item as an either/or with each other.
                     continue
                 hintable_loc_reqs[loc].add(item)
+
+        # Some games have single items that lock off a large percentage of their checks. This makes the item so
+        # ubiquitous that in most seeds it would end up on any path that has any of its items in that game. Thus making
+        # it not a very useful item to hint.
+        # So if any item locks more than our set threshold we'll make it ineligible for path hinting.
+        everything = CollectionState(multiworld)
+        for loc in multiworld.get_filled_locations():
+            everything.collect(loc.item, True)
+
+        candidates_by_player: Dict[int, Set[Item]] = defaultdict(set)
+        for reqs in hintable_loc_reqs.values():
+            for item in reqs:
+                candidates_by_player[item.player].add(item)
+
+        locks_too_much: Set[Item] = set()
+        if cls.filter_locks_too_much:
+            for gate_player, candidates in candidates_by_player.items():
+                reachable = [loc for loc in multiworld.get_locations(gate_player)
+                             if loc.can_reach(everything)]
+                if not reachable:
+                    continue
+                for item in candidates:
+                    probe = everything.copy()
+                    probe.remove(item)
+                    locked = sum(1 for loc in reachable if not loc.can_reach(probe))
+                    if 100 * locked / len(reachable) >= cls.locks_too_much_threshold:
+                        locks_too_much.add(item)
+
+        logging.debug("Excluded because it locks too much of someone's game: %s",
+                     sorted(f"{i.name} (P{i.player})" for i in locks_too_much))
+
+        for reqs in hintable_loc_reqs.values():
+            reqs -= locks_too_much
 
         # Locate which regions hold each copy of required bulk items.
         # Potentially useful for a bulk item hint like: "Need more Power Stars? Player X's Y region has 4 of them!"
@@ -453,10 +558,8 @@ class ArchiLogicWorld(World):
                     continue
 
                 state_minus_item = final_state.copy()
-                state_minus_item.remove_item(key, player, count)
-                state_minus_item.reachable_regions[player] = set()
-                state_minus_item.blocked_connections[player] = set()
-                state_minus_item.stale[player] = True
+                for _ in range(count):
+                    state_minus_item.remove(item)
 
                 if multiworld.completion_condition[player](state_minus_item):
                     # Game is still beatable without this item. Skip it
@@ -464,10 +567,21 @@ class ArchiLogicWorld(World):
 
                 deep_state_cache[item] = state_minus_item
                 shallow = final_state.copy()
-                shallow.remove_item(key, player, count)
+                shallow_backup = (shallow.reachable_regions[item.player],
+                                    shallow.blocked_connections[item.player],
+                                    shallow.stale[item.player])
+                for _ in range(count):
+                    shallow.remove(item)
+                (shallow.reachable_regions[item.player],
+                 shallow.blocked_connections[item.player],
+                 shallow.stale[item.player]) = shallow_backup
                 shallow_state_cache[item] = shallow
 
-            reqs_for_goal = set(deep_state_cache)
+            reqs_for_goal = {i for i in deep_state_cache
+                             if i not in locks_too_much and not is_forced_early(i)}
+            if not reqs_for_goal:
+                # Everything got filtered — better to report the raw set than nothing.
+                reqs_for_goal = set(deep_state_cache)
 
             gate_cache = {}
             def item_opens_gate(spot, item):
@@ -532,20 +646,21 @@ class ArchiLogicWorld(World):
             # If your goal condition is "beat the end boss" then my hope is, if it's not represented by getting some
             # item, or checking some location, then HOPEFULLY it would be a "beat the end boss" event.
             # (I guess we'll see how that works out. But it sounds good for now)
-            seen_endpoint_items = set()
-            while len(found_endpoints) == 1:
-                item = next(iter(found_endpoints))
-                if item in seen_endpoint_items or item.location is None:
-                    break
-                seen_endpoint_items.add(item)
-                deeper = set()
-                for req in location_necessary.get(item.location, ()):
-                    if req.is_event or is_hintable(req):
-                        deeper.add(req)
-                deeper.discard(item)
-                if not deeper:
-                    break
-                found_endpoints = deeper
+            if cls.expand_single_endpoints:
+                seen_endpoint_items = set()
+                while len(found_endpoints) == 1:
+                    item = next(iter(found_endpoints))
+                    if item in seen_endpoint_items or item.location is None:
+                        break
+                    seen_endpoint_items.add(item)
+                    deeper = set()
+                    for req in location_necessary.get(item.location, ()):
+                        if req.is_event or is_hintable(req):
+                            deeper.add(req)
+                    deeper.discard(item)
+                    if not deeper:
+                        break
+                    found_endpoints = deeper
 
             logging.info("P%d endpoints:       %s", player, sorted(i.name for i in found_endpoints))
             return found_endpoints
@@ -562,6 +677,9 @@ class ArchiLogicWorld(World):
         # The hints will be structured in some form of: "This item is on the path to these endpoints"
         items_to_paths = {}
 
+        # Keep track of any endpoints that don't end up with useful paths to hint
+        pathless_endpoints: Dict[int, Dict[Item, Set[Item]]] = defaultdict(dict)
+
         for player in multiworld.player_ids:
             if multiworld.game[player] == cls.game: continue
             paths[player] = {}
@@ -569,6 +687,11 @@ class ArchiLogicWorld(World):
 
             # Each endpoint has its own path
             for endpoint in player_endpoints[player]:
+                # The endpoint is required to win too, even if nothing gates it. Events aren't
+                # collectable, so they're not go-mode items.
+                if not endpoint.is_event:
+                    go_mode_items.setdefault(player, set()).add(endpoint)
+
                 paths[player][endpoint] = set()
                 path = paths[player][endpoint]
                 endpoint_reqs = hintable_loc_reqs[endpoint.location]
@@ -578,11 +701,12 @@ class ArchiLogicWorld(World):
                     item = req_stack.pop()
                     if item in path:
                         continue
-                    if item in player_endpoints[player]:
+                    if cls.filter_other_endpoints and item in player_endpoints[player]:
                         continue
-                    if is_multi_copy(item):
+                    if cls.filter_multi_copy_items and is_multi_copy(item):
                         # Several copies exist, but our code (for now) assumes that all multi-copy items are either/ors.
-                        # Not technically true, but I can't think of a way to handle it correctly without quintupling gen time lmao
+                        # Not technically true, but I can't think of a way to handle it correctly
+                        # without quintupling gen time lmao
                         continue
 
                     # Item is on the path
@@ -599,10 +723,76 @@ class ArchiLogicWorld(World):
                     if not item.location is None:
                         req_stack.extend(hintable_loc_reqs[item.location])
 
+                # Nothing gates this endpoint — it's precollected or available from the start.
+                # There's no path to hint about, so drop it; it stays in player_endpoints and
+                # go_mode_items for hint types that don't need a path.
+                if cls.filter_empty_paths and not path:
+                    del paths[player][endpoint]
+
+        # Endpoints with no meaningful path: either nothing gates them at all, or the only
+        # things that do are items we deliberately suppress. Either way the player isn't
+        # blocked, so they get their own hint. The value is the suppressed gates — empty when
+        # the endpoint was simply free. A long list here means the thresholds are too tight.
+        if cls.filter_empty_paths:
+            for player, eps in player_endpoints.items():
+                for ep in eps:
+                    if ep in paths.get(player, {}) or ep.location is None:
+                        continue
+                    raw = necessary_reqs.get(ep.location, set())
+                    suppressed = {r for r in raw if r in locks_too_much or is_forced_early(r)}
+                    if suppressed == raw:
+                        pathless_endpoints[player][ep] = suppressed
+
+        # TEMPORARY — dump paths to JSON for offline comparison.
+        dump = {}
+        for player, endpoints in paths.items():
+            dump[str(player)] = {
+                "game": multiworld.game[player],
+                "name": multiworld.player_name[player],
+                "path_sizes": {endpoint.name: len(path)
+                               for endpoint, path in sorted(endpoints.items(), key=lambda kv: kv[0].name)},
+                "paths": {
+                    endpoint.name: [
+                        {
+                            "name": i.name,
+                            "player": i.player,
+                            "is_event": i.is_event,
+                            "location": i.location.name if i.location else None,
+                            "location_player": i.location.player if i.location else None,
+                        }
+                        for i in sorted(path, key=lambda x: (x.player, x.name))
+                    ]
+                    for endpoint, path in sorted(endpoints.items(), key=lambda kv: kv[0].name)
+                },
+            }
+
+        # Stamp the settings that produced this file — two dumps from different flag states are
+        # otherwise indistinguishable. Underscore prefixes can't collide with the player ids.
+        dump["_flags"] = {name: getattr(cls, name) for name in
+                          ("filter_events", "filter_empty_paths", "filter_other_endpoints",
+                           "expand_single_endpoints", "filter_multi_copy_items",
+                           "filter_forced_early", "filter_locks_too_much")}
+        dump["_thresholds"] = {"bulk_item_threshold": cls.bulk_item_threshold,
+                               "locks_too_much_threshold": cls.locks_too_much_threshold}
+        dump["_pathless_endpoints"] = {
+            str(p): {ep.name: sorted(g.name for g in gates) for ep, gates in eps.items()}
+            for p, eps in sorted(pathless_endpoints.items())}
+
+        dump_path = os.path.join(run_dir, "paths.json")
+
+        with open(dump_path, "w", encoding="utf-8") as f:
+            json.dump(dump, f, indent=2, sort_keys=False)
+        logging.info("Wrote %s (%d players, %d paths)", dump_path, len(dump) - 3,
+                     sum(len(p["paths"]) for k, p in dump.items() if not k.startswith("_")))
+
         t4 = time.perf_counter()
         logging.info("ArchiLogic timings: step1 %.2fs  step2 %.2fs  step3 %.2fs  step4 %.2fs  total %.2fs",
                      t1 - t0, t2 - t1, t3 - t2, t4 - t3, t4 - t0)
-        logging.info("Completed calculating backing structures for hints.")
+        logging.info("Completed calculating hint paths.")
+
+        logging.getLogger().removeHandler(run_log)
+        run_log.close()
+
         #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Build up the logical backing for our hints:
