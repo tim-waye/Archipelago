@@ -7,6 +7,8 @@ from collections import Counter, defaultdict
 
 from BaseClasses import CollectionState, Location, Item, ItemClassification, DEFAULT_COLLECTION_RULE, Region
 from worlds.AutoWorld import World
+from worlds.archilogic.HintClasses import MultiPathHint, Directness, SinglePathHint, WothHint
+
 
 class ArchiLogicWorld(World):
     game = "ArchiLogic"
@@ -80,6 +82,8 @@ class ArchiLogicWorld(World):
         logging.info("Entered Stage Pre-Output for ArchiLogic.")
         t0 = time.perf_counter()
 
+        all_players = [player for player in multiworld.player_ids if not multiworld.game[player] == cls.game]
+
         # Setup debug logging and json dumping
         here: str = os.path.dirname(__file__)
         run_dir = os.path.join(here, "analysis",
@@ -131,6 +135,7 @@ class ArchiLogicWorld(World):
                     raise RuntimeError("During playthrough generation, the game was determined to be unbeatable. "
                                        "Something went terribly wrong here. "
                                        f"Unreachable progression items: {sphere_candidates}")
+        t1a = time.perf_counter()
 
         # Stage Two: prune spheres down to only the required locations.
         required_locations = {location for sphere in collection_spheres for location in sphere}
@@ -143,6 +148,7 @@ class ArchiLogicWorld(World):
                 else:
                     required_locations.add(loc)
             sphere -= to_delete
+        t1b = time.perf_counter()
 
         # Stage Three: Repair any unintentional links that may have been made in step two.
         # One last forward collection iteration through the state.
@@ -157,8 +163,7 @@ class ArchiLogicWorld(World):
 
             collection_spheres.append(sphere)
 
-            for player in multiworld.player_ids:
-                if multiworld.game[player] == cls.game: continue
+            for player in all_players:
                 if player not in go_mode_sphere and multiworld.completion_condition[player](state):
                     go_mode_sphere[player] = len(collection_spheres) - 1
 
@@ -187,8 +192,7 @@ class ArchiLogicWorld(World):
 
         # Loop through all required locations to determine which are required for each player.
         global_req_locs: Set[Location] = {loc for sphere in collection_spheres for loc in sphere}
-        for player in multiworld.player_ids:
-            if multiworld.game[player] == cls.game: continue
+        for player in all_players:
             logging.info("Determining which locations are needed to beat Player %d's game.", player)
             req = set(global_req_locs)
             for loc in sorted(global_req_locs):
@@ -299,8 +303,7 @@ class ArchiLogicWorld(World):
         location_necessary: Dict[Location, Set[Item]] = {}
 
         # Now we loop through the spheres for each player, determine the target locations, then each location's reqs
-        for player in multiworld.player_ids:
-            if multiworld.game[player] == cls.game: continue
+        for player in all_players:
             logging.info("Determining location access requirements for Player %d's game.", player)
 
             for sphere_index, sphere in enumerate(collection_spheres):
@@ -402,6 +405,7 @@ class ArchiLogicWorld(World):
             known_either_or_items = resolved_region_reqs[reg] - resolved_region_necessary[reg]
             if known_either_or_items:
                 either_or_regions[reg] = known_either_or_items
+        t4 = time.perf_counter()
 
         # Step Five: Determine which items and location are worth giving hints for.
 
@@ -466,6 +470,7 @@ class ArchiLogicWorld(World):
 
         for reqs in hintable_loc_reqs.values():
             reqs -= locks_too_much
+        t5 = time.perf_counter()
 
         # Locate which regions hold each copy of required bulk items.
         # Potentially useful for a bulk item hint like: "Need more Power Stars? Player X's Y region has 4 of them!"
@@ -548,6 +553,7 @@ class ArchiLogicWorld(World):
             #   shallow - caches intact, so only rules reading prog_items directly flip.
             #             This is what separates `state.has(X)` gates from `can_reach(...)`
             #             gates, which otherwise flip for every item on the path.
+            _t0 = time.perf_counter()
             deep_state_cache = {}
             shallow_state_cache = {}
             for item in items_by_name(player).values():
@@ -591,7 +597,12 @@ class ArchiLogicWorld(World):
 
             found_endpoints = set()
             remaining_candidates = set()
+            _t1 = time.perf_counter()
             goal_locs = goal_locking_locations(player, final_state)
+            _t2 = time.perf_counter()
+            logging.info("P%d probes %.2fs (%d kept) | goal_locking %.2fs (%d locs of %d)",
+                         player, _t1 - _t0, len(deep_state_cache), _t2 - _t1,
+                         len(goal_locs), len(multiworld.get_locations(player)))
 
             if not goal_locs:
                 # The goal does not depend on access rules, so the items are the only endpoints
@@ -655,7 +666,12 @@ class ArchiLogicWorld(World):
                     seen_endpoint_items.add(item)
                     deeper = set()
                     for req in location_necessary.get(item.location, ()):
-                        if req.is_event or is_hintable(req):
+                        copies = item_counts[(req.name, req.player)]
+                        if (req.is_event
+                                or (is_hintable(req)
+                                    and copies <= cls.bulk_item_threshold
+                                    and not (cls.filter_multi_copy_items and copies > 1)
+                                    and req not in locks_too_much)):
                             deeper.add(req)
                     deeper.discard(item)
                     if not deeper:
@@ -680,8 +696,7 @@ class ArchiLogicWorld(World):
         # Keep track of any endpoints that don't end up with useful paths to hint
         pathless_endpoints: Dict[int, Dict[Item, Set[Item]]] = defaultdict(dict)
 
-        for player in multiworld.player_ids:
-            if multiworld.game[player] == cls.game: continue
+        for player in all_players:
             paths[player] = {}
             player_endpoints[player] = endpoint_items(player, state)
 
@@ -702,11 +717,6 @@ class ArchiLogicWorld(World):
                     if item in path:
                         continue
                     if cls.filter_other_endpoints and item in player_endpoints[player]:
-                        continue
-                    if cls.filter_multi_copy_items and is_multi_copy(item):
-                        # Several copies exist, but our code (for now) assumes that all multi-copy items are either/ors.
-                        # Not technically true, but I can't think of a way to handle it correctly
-                        # without quintupling gen time lmao
                         continue
 
                     # Item is on the path
@@ -739,9 +749,8 @@ class ArchiLogicWorld(World):
                     if ep in paths.get(player, {}) or ep.location is None:
                         continue
                     raw = necessary_reqs.get(ep.location, set())
-                    suppressed = {r for r in raw if r in locks_too_much or is_forced_early(r)}
-                    if suppressed == raw:
-                        pathless_endpoints[player][ep] = suppressed
+                    pathless_endpoints[player][ep] = raw - hintable_loc_reqs.get(ep.location, set())
+        t6 = time.perf_counter()
 
         # TEMPORARY — dump paths to JSON for offline comparison.
         dump = {}
@@ -785,10 +794,80 @@ class ArchiLogicWorld(World):
         logging.info("Wrote %s (%d players, %d paths)", dump_path, len(dump) - 3,
                      sum(len(p["paths"]) for k, p in dump.items() if not k.startswith("_")))
 
-        t4 = time.perf_counter()
-        logging.info("ArchiLogic timings: step1 %.2fs  step2 %.2fs  step3 %.2fs  step4 %.2fs  total %.2fs",
-                     t1 - t0, t2 - t1, t3 - t2, t4 - t3, t4 - t0)
-        logging.info("Completed calculating hint paths.")
+        logging.info("ArchiLogic timings: build-spheres %.2fs  prune-spheres %.2fs  rebuild-spheres %.2fs  "
+                     "required-locs %.2fs  access-reqs %.2fs  resolve-events %.2fs  filters %.2fs  "
+                     "endpoints+paths %.2fs  total %.2fs",
+                     t1a - t0, t1b - t1a, t1 - t1b, t2 - t1, t3 - t2, t4 - t3, t5 - t4, t6 - t5, t6 - t0)
+
+        player_regions = {p: {r.name for r in multiworld.get_regions(p)}
+                          for p in all_players}
+
+        def player_has_regions(player: int) -> bool:
+            return True if player_regions[player] and len(player_regions[player]) > 1 else False
+
+        class HintSet:
+            generic_woth: WothHint
+            specific_woths: Set[WothHint]
+            single_paths: Set[SinglePathHint]
+            multi_paths: Set[MultiPathHint]
+
+            def __init__(self):
+                self.specific_woths = set()
+                self.single_paths = set()
+                self.multi_paths = set()
+
+        hint_sets: Dict[Item, HintSet] = {}
+        for item, endpoints in items_to_paths.items():
+            hint_set = HintSet()
+            hint_directness = Directness.Location if item.location else Directness.Item
+            path_players = set()
+
+            endpoints_dict: Dict[Tuple[int, str], Set[Item]] = defaultdict(set)
+            for end in endpoints:
+                # Create single-path hint
+                hint_set.single_paths.add(
+                    SinglePathHint(
+                        item,
+                        multiworld.player_name[item.player],
+                        end,
+                        hint_directness,
+                    )
+                )
+                # Add to dict for multi-path hint
+                endpoints_dict[(end.player, multiworld.player_name[end.player])].add(end)
+
+                # Keep track of which players worlds this is path to
+                path_players.add(end.player)
+
+            # Add multipath hint for item
+            hint_set.multi_paths.add(MultiPathHint(
+                item,
+                multiworld.player_name[item.player],
+                endpoints_dict,
+                hint_directness,
+            ))
+
+            # Add all WOTH hints for item
+            hint_set.generic_woth = WothHint(
+                item,
+                multiworld.player_name[item.player],
+                hint_directness,
+                set(),
+                set(),
+                False
+            )
+            hint_set.specific_woths.add(WothHint(
+                item,
+                multiworld.player_name[item.player],
+                hint_directness,
+                path_players,
+                [multiworld.player_name[player] for player in path_players],
+                path_players == all_players,
+            ))
+
+            hint_sets[item] = hint_set
+
+
 
         logging.getLogger().removeHandler(run_log)
         run_log.close()
