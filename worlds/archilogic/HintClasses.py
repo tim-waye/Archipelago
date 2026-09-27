@@ -35,21 +35,12 @@ class WothHint:
             raise ArchiLogicError(f"Error writing hint text for item: {self.item}")
 
         end_str = "is on the Path to "
-
         if all_players:
             end_str += " Everybody's "
-
         end_str += f"Victory"
 
         if not all_players and len(woth_players) > 0:
-            length = len(woth_player_names)
-            end_str += " for "
-            for i, name in enumerate(self.woth_player_names):
-                if i == length - 1:
-                    end_str += "and "
-                end_str += f"{name}"
-                if i < length - 1:
-                    end_str += ", "
+            end_str += f" for {concat_list(sorted(self.woth_player_names), ',', True)}"
         self.hint_text = f"{hint_str}{end_str}."
 
 class SinglePathHint:
@@ -100,24 +91,12 @@ class MultiPathHint:
             raise ArchiLogicError(f"Error writing hint text for item: {self.item}")
 
         # Second half lists all endpoints the item is on the path to.
-        end_str = "is on the path to "
-        for i, ((_, player), ends) in enumerate(endpoints.items()):
-            for j, e in enumerate(ends):
-                if j == 0:
-                    if i == len(endpoints.keys()) - 1:
-                        end_str += "and "
-                    end_str += f"{player}'s"
-                end_str += f" {e.name}"
-                if j < len(ends) - 2:
-                    end_str += ","
-                if j == len(ends) - 2:
-                    end_str += ", and"
-            if i == len(endpoints.keys()) - 1:
-                end_str += "."
-            else:
-                end_str += "; "
+        end_list = []
+        for (_, player), ends in endpoints.items():
+            end_list.append(f"{concat_list([end.name for end in ends], ",", True)} for {player}")
 
-        self.hint_text = f"{hint_str}{end_str}"
+        end_str = f"is on the path to {concat_list(sorted(end_list), ';', True)}"
+        self.hint_text = f"{hint_str}{end_str}."
 
 class ArchiLogicError(RuntimeError):
     pass
@@ -147,5 +126,13 @@ def write_item_hint_text(item, directness) -> Tuple[str, Directness]:
                 raise ArchiLogicError("Tried to make a Region path hint for an item with no parent region")
     raise ArchiLogicError(f"Unable to write hint text for item: {item.name}")
 
+def concat_list(parts: list[str], delimiter: str, oxford_delim: bool) -> str:
+    if not parts:
+        return ""
+    if len(parts) == 1:
+        return parts[0]
+    if len(parts) == 2:
+        return f"{parts[0]}{delimiter if oxford_delim else ""} and {parts[1]}"
+    return f"{delimiter} ".join(parts[:-1]) + f"{delimiter if oxford_delim else ""} and {parts[-1]}"
 
 
