@@ -77,6 +77,12 @@ class ArchiLogicWorld(World):
     # and don't provide much useful information for path hints.
     filter_locks_too_much = True
 
+    # Flags for Hint creation
+    create_generic_woths = False
+    create_specific_woths = True
+    create_single_paths = False
+    create_multi_paths = True
+
     @classmethod
     def stage_pre_output(cls, multiworld):
         logging.info("Entered Stage Pre-Output for ArchiLogic.")
@@ -805,6 +811,9 @@ class ArchiLogicWorld(World):
         def player_has_regions(player: int) -> bool:
             return True if player_regions[player] and len(player_regions[player]) > 1 else False
 
+        t7 = time.perf_counter()
+
+        # Step Six: Create all the hints for all the hintable items.
         class HintSet:
             generic_woth: WothHint
             specific_woths: Set[WothHint]
@@ -818,56 +827,82 @@ class ArchiLogicWorld(World):
 
         hint_sets: Dict[Item, HintSet] = {}
         for item, endpoints in items_to_paths.items():
+            if not (
+                    cls.create_single_paths or
+                    cls.create_multi_paths or
+                    cls.create_specific_woths or
+                    cls.create_generic_woths
+            ):
+                logging.debug("Hint creation disabled. For some reason.")
+                break
+
             hint_set = HintSet()
             hint_directness = Directness.Location if item.location else Directness.Item
             path_players = set()
-
             endpoints_dict: Dict[Tuple[int, str], Set[Item]] = defaultdict(set)
-            for end in endpoints:
-                # Create single-path hint
-                hint_set.single_paths.add(
-                    SinglePathHint(
-                        item,
-                        multiworld.player_name[item.player],
-                        end,
-                        hint_directness,
-                    )
-                )
-                # Add to dict for multi-path hint
-                endpoints_dict[(end.player, multiworld.player_name[end.player])].add(end)
 
-                # Keep track of which players worlds this is path to
-                path_players.add(end.player)
+            for end in endpoints:
+                if not (cls.create_single_paths or cls.create_multi_paths or cls.create_specific_woths):
+                    break
+
+                if cls.create_single_paths:
+                    # Create single-path hint
+                    hint_set.single_paths.add(
+                        SinglePathHint(
+                            item,
+                            multiworld.player_name[item.player],
+                            end,
+                            hint_directness,
+                        )
+                    )
+
+                if cls.create_multi_paths:
+                    # Add to dict for multi-path hint
+                    endpoints_dict[(end.player, multiworld.player_name[end.player])].add(end)
+
+                if cls.create_specific_woths:
+                    # Keep track of which players worlds this is path to
+                    path_players.add(end.player)
 
             # Add multipath hint for item
-            hint_set.multi_paths.add(MultiPathHint(
-                item,
-                multiworld.player_name[item.player],
-                endpoints_dict,
-                hint_directness,
-            ))
+            if cls.create_multi_paths:
+                hint_set.multi_paths.add(MultiPathHint(
+                    item,
+                    multiworld.player_name[item.player],
+                    endpoints_dict,
+                    hint_directness,
+                ))
 
             # Add all WOTH hints for item
-            hint_set.generic_woth = WothHint(
-                item,
-                multiworld.player_name[item.player],
-                hint_directness,
-                set(),
-                set(),
-                False
-            )
-            hint_set.specific_woths.add(WothHint(
-                item,
-                multiworld.player_name[item.player],
-                hint_directness,
-                path_players,
-                [multiworld.player_name[player] for player in path_players],
-                path_players == all_players,
-            ))
+            if cls.create_generic_woths:
+                hint_set.generic_woth = WothHint(
+                    item,
+                    multiworld.player_name[item.player],
+                    hint_directness,
+                    set(),
+                    set(),
+                    False
+                )
+
+            if cls.create_specific_woths:
+                hint_set.specific_woths.add(WothHint(
+                    item,
+                    multiworld.player_name[item.player],
+                    hint_directness,
+                    path_players,
+                    set(multiworld.player_name[player] for player in path_players),
+                    path_players == all_players,
+                ))
 
             hint_sets[item] = hint_set
 
-
+        t8 = time.perf_counter()
+        logging.info("Hint-Building timing =  %.2fs",t8 - t7)
+        logging.info(f"Hints built: "
+                     f"{"\n\t- Generic Woth Hints" if cls.create_generic_woths else ""}"
+                     f"{"\n\t- Specific Woth Hints" if cls.create_specific_woths else ""}"
+                     f"{"\n\t- Single Path Hints" if cls.create_single_paths else ""}"
+                     f"{"\n\t- Multi Path Hints" if cls.create_multi_paths else ""}")
 
         logging.getLogger().removeHandler(run_log)
         run_log.close()
