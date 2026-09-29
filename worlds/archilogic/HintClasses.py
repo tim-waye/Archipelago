@@ -24,13 +24,13 @@ def flatten_item(item: Item) -> dict:
 class Hint:
     hint_type: HintType
 
-    def __init__(self, hint_item: Item, finder_name: str, directness: Directness):
+    def __init__(self, hint_item: Item, directness: Directness):
         self.item = hint_item
         self.item_id = hint_item.code
         self.item_player = hint_item.player
         self.location_id = hint_item.location.address if hint_item.location else None
         self.location_player = hint_item.location.player if hint_item.location else None
-        self.finder_name = finder_name
+        self.finder_id = hint_item.player if hint_item.location is None else hint_item.location.player
         # First half of hint text.
         self.subject_text, self.directness = write_item_hint_text(hint_item, directness)
         self.hint_text = ""
@@ -44,23 +44,20 @@ class Hint:
             "location_id": self.location_id,
             "location_player": self.location_player,
             "directness": self.directness.value,
-            "finder_name": self.finder_name,
+            "finder_id": self.finder_id,
         }
 
 class WothHint(Hint):
     def __init__(
             self,
             hint_item: Item,
-            finder_name: str,
             directness: Directness,
             woth_players: Set[int],
             woth_player_names: Set[str],
             all_players: bool,
     ):
-        super().__init__(hint_item, finder_name, directness)
-        self.finder_id = hint_item.player
+        super().__init__(hint_item, directness)
         self.woth_player_ids = woth_players
-        self.woth_player_names = woth_player_names
 
         # Write hint text. First half of the string is already initialized in the super constructor
         end_str = "is on the Path to "
@@ -70,7 +67,7 @@ class WothHint(Hint):
 
         if not all_players and len(woth_players) > 0:
             self.hint_type = HintType.SpecificWoth
-            end_str += f" for {concat_list(sorted(self.woth_player_names), ',', True)}"
+            end_str += f" for {concat_list(sorted(woth_player_names), ',', True)}"
         else:
             self.hint_type = HintType.GenericWoth
 
@@ -78,21 +75,17 @@ class WothHint(Hint):
 
     def to_slot_data(self) -> dict:
         slot_data = super().to_slot_data()
-        slot_data["finder_id"] = self.finder_id
         slot_data["woth_player_ids"] = self.woth_player_ids
-        slot_data["woth_player_names"] = self.woth_player_names
         return slot_data
 
 class SinglePathHint(Hint):
     def __init__(
             self,
             hint_item: Item,
-            finder_name: str,
             endpoint: Item,
             directness: Directness,
     ):
-        super().__init__(hint_item, finder_name, directness)
-        self.finder_id = hint_item.player
+        super().__init__(hint_item, directness)
         self.endpoint = endpoint
         self.hint_type = HintType.SinglePath
 
@@ -101,7 +94,6 @@ class SinglePathHint(Hint):
 
     def to_slot_data(self) -> dict:
         slot_data = super().to_slot_data()
-        slot_data["finder_id"] = self.finder_id
         slot_data["endpoint"] = flatten_item(self.endpoint)
         return slot_data
 
@@ -109,12 +101,10 @@ class MultiPathHint(Hint):
     def __init__(
             self,
             hint_item: Item,
-            finder_name: str,
             endpoints: Dict[Tuple[int, str], Set[Item]],
             directness: Directness,
     ):
-        super().__init__(hint_item, finder_name, directness)
-        self.finder_id = hint_item.player
+        super().__init__(hint_item, directness)
         self.endpoints = endpoints
         self.hint_type = HintType.MultiPath
 
@@ -128,7 +118,6 @@ class MultiPathHint(Hint):
 
     def to_slot_data(self) -> dict:
         slot_data = super().to_slot_data()
-        slot_data["finder_id"] = self.finder_id
         slot_data["endpoints"] = [
             flatten_item(e)
             for _, ends in sorted(self.endpoints.items())

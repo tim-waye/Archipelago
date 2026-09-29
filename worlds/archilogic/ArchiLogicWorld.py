@@ -2,18 +2,29 @@ import json
 import logging
 import os
 import time
-from typing import Dict, List, Optional, Set, Tuple
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Set, Tuple, Any
 from collections import Counter, defaultdict
 
+import math
+
 from BaseClasses import CollectionState, Location, Item, ItemClassification, DEFAULT_COLLECTION_RULE, Region
+from Options import OptionError
 from worlds.AutoWorld import World
-from worlds.archilogic.HintClasses import MultiPathHint, Directness, SinglePathHint, WothHint
+from worlds.archilogic.HintClasses import MultiPathHint, Directness, SinglePathHint, WothHint, Hint
 
 
 class ArchiLogicWorld(World):
     game = "ArchiLogic"
     item_name_to_id: Dict[str, int] = {}
     location_name_to_id: Dict[str, int] = {}
+
+    @classmethod
+    def stage_assert_generate(cls, multiworld) -> None:
+        slots = multiworld.get_game_players(cls.game)
+        if len(slots) > 1:
+            raise OptionError(
+                f"ArchiLogic supports only one slot per multiworld. Please remove extra ArchiLogic yaml")
 
     # TODO make these overrideable from options in the yaml. Per game preferably
     bulk_item_threshold = 6
@@ -83,12 +94,19 @@ class ArchiLogicWorld(World):
     create_single_paths = False
     create_multi_paths = True
 
+    hints_per_player = 20
+    selected_hints: List[Hint] = []
+
+    def fill_slot_data(self) -> Dict[str, Any]:
+        return {"hints": [h.to_slot_data() for h in self.selected_hints]}
+
     @classmethod
     def stage_pre_output(cls, multiworld):
         logging.info("Entered Stage Pre-Output for ArchiLogic.")
         t0 = time.perf_counter()
 
-        all_players = [player for player in multiworld.player_ids if not multiworld.game[player] == cls.game]
+        all_players = [player for player in multiworld.player_ids if multiworld.game[player] != cls.game]
+        archilogic_world = multiworld.worlds[multiworld.get_game_players(cls.game)[0]]
 
         # Setup debug logging and json dumping
         here: str = os.path.dirname(__file__)
@@ -814,16 +832,12 @@ class ArchiLogicWorld(World):
         t7 = time.perf_counter()
 
         # Step Six: Create all the hints for all the hintable items.
+        @dataclass
         class HintSet:
-            generic_woth: WothHint
-            specific_woths: Set[WothHint]
-            single_paths: Set[SinglePathHint]
-            multi_paths: Set[MultiPathHint]
-
-            def __init__(self):
-                self.specific_woths = set()
-                self.single_paths = set()
-                self.multi_paths = set()
+            generic_woth: Optional[WothHint] = None
+            specific_woth: Optional[WothHint] = None
+            single_paths: Set[SinglePathHint] = field(default_factory=set)
+            multi_path: Optional[MultiPathHint] = None
 
         hint_sets: Dict[Item, HintSet] = {}
         for item, endpoints in items_to_paths.items():
@@ -850,7 +864,6 @@ class ArchiLogicWorld(World):
                     hint_set.single_paths.add(
                         SinglePathHint(
                             item,
-                            multiworld.player_name[item.player],
                             end,
                             hint_directness,
                         )
@@ -866,18 +879,16 @@ class ArchiLogicWorld(World):
 
             # Add multipath hint for item
             if cls.create_multi_paths:
-                hint_set.multi_paths.add(MultiPathHint(
+                hint_set.multi_path = MultiPathHint(
                     item,
-                    multiworld.player_name[item.player],
                     endpoints_dict,
                     hint_directness,
-                ))
+                )
 
             # Add all WOTH hints for item
             if cls.create_generic_woths:
                 hint_set.generic_woth = WothHint(
                     item,
-                    multiworld.player_name[item.player],
                     hint_directness,
                     set(),
                     set(),
@@ -885,24 +896,51 @@ class ArchiLogicWorld(World):
                 )
 
             if cls.create_specific_woths:
-                hint_set.specific_woths.add(WothHint(
+                hint_set.specific_woth = WothHint(
                     item,
-                    multiworld.player_name[item.player],
                     hint_directness,
                     path_players,
                     set(multiworld.player_name[player] for player in path_players),
                     path_players == all_players,
-                ))
+                )
 
             hint_sets[item] = hint_set
 
         t8 = time.perf_counter()
+
+        # Now select randomly select which hints go into the pool based on the seed
+        hint_candidates: Dict[int, List[Item]] = defaultdict(list)
+        for item in hint_sets:
+            hint_candidates[item.player].append(item)
+        for items in hint_candidates.values():
+            items.sort(key=lambda i: (i.player, i.name))
+
+        selected_hints = []
+        for player in all_players:
+            selected_items = archilogic_world.random.sample(
+                hint_candidates[player], min(len(hint_candidates[player]), cls.hints_per_player))
+
+            # For now I'm just going 2/3rds of hints are multipath, remaining are specific woth
+            multipath_num = math.ceil(len(selected_items) * 2 / 3)
+            woth_num = len(selected_items) - multipath_num
+
+            for item in selected_items:
+                hint_set = hint_sets[item]
+                if multipath_num > 0 and hint_set.multi_path:
+                    selected_hints.append(hint_set.multi_path)
+                    multipath_num -= 1
+                elif woth_num > 0 and hint_set.specific_woth:
+                    selected_hints.append(hint_set.specific_woth)
+                    woth_num -= 1
+        archilogic_world.selected_hints = selected_hints
+
+
         logging.info("Hint-Building timing =  %.2fs",t8 - t7)
         logging.info(f"Hints built: "
-                     f"{"\n\t- Generic Woth Hints" if cls.create_generic_woths else ""}"
-                     f"{"\n\t- Specific Woth Hints" if cls.create_specific_woths else ""}"
-                     f"{"\n\t- Single Path Hints" if cls.create_single_paths else ""}"
-                     f"{"\n\t- Multi Path Hints" if cls.create_multi_paths else ""}")
+                     f"{'\n\t- Generic Woth Hints' if cls.create_generic_woths else ''}"
+                     f"{'\n\t- Specific Woth Hints' if cls.create_specific_woths else ''}"
+                     f"{'\n\t- Single Path Hints' if cls.create_single_paths else ''}"
+                     f"{'\n\t- Multi Path Hints' if cls.create_multi_paths else ''}")
 
         logging.getLogger().removeHandler(run_log)
         run_log.close()
