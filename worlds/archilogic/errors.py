@@ -1,0 +1,2 @@
+class ArchiLogicError(RuntimeError):
+    pass

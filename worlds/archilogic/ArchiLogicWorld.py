@@ -3,7 +3,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple, Any
+from typing import Dict, List, Optional, Set, Tuple, Any, Callable
 from collections import Counter, defaultdict
 
 import math
@@ -11,7 +11,8 @@ import math
 from BaseClasses import CollectionState, Location, Item, ItemClassification, DEFAULT_COLLECTION_RULE, Region
 from Options import OptionError
 from worlds.AutoWorld import World
-from worlds.archilogic.HintClasses import MultiPathHint, Directness, SinglePathHint, WothHint, Hint
+from worlds.archilogic.HintClasses import MultiPathHint, Directness, SinglePathHint, WothHint, Hint, set_player_profiles
+from worlds.archilogic.games import GameProfile, profile_for, CustomEndpoint
 
 
 class ArchiLogicWorld(World):
@@ -34,6 +35,10 @@ class ArchiLogicWorld(World):
         ItemClassification.progression_skip_balancing,
         ItemClassification.progression_deprioritized_skip_balancing,
     ]
+
+    # Debug artifacts written into the per-run analysis directory.
+    dump_paths = True                # endpoint paths — the main tuning artifact
+    dump_profile_reference = False   # names, groups and events, for writing a GameProfile
 
     # Making the paths feel good and useful is going to be a bit of a tuning exercise. I've made a few features to
     # filter what is eligible for path hints, but it's going to take some trial and error to figure out what's best.
@@ -105,8 +110,12 @@ class ArchiLogicWorld(World):
         logging.info("Entered Stage Pre-Output for ArchiLogic.")
         t0 = time.perf_counter()
 
+        # Initialize some helper objects for later
         all_players = [player for player in multiworld.player_ids if multiworld.game[player] != cls.game]
         archilogic_world = multiworld.worlds[multiworld.get_game_players(cls.game)[0]]
+        set_player_profiles({p: multiworld.game[p] for p in multiworld.player_ids})
+        logging.info("ArchiLogic profiles loaded: %s", sorted(GameProfile.PROFILES))
+
 
         # Setup debug logging and json dumping
         here: str = os.path.dirname(__file__)
@@ -269,17 +278,18 @@ class ArchiLogicWorld(World):
         # be to simply not give hints for items only used in either/or situations. So it's unnecessary (at this point)
         # to calculate every potential set of optional items for each either/or, since ultimately we're going to trim
         # them out anyway.
-        def get_access_reqs(target: Location | Region, candidates: List[Item]) -> Tuple[Set[Item], Set[Item]]:
+        def get_access_reqs(reaches: Callable[[CollectionState], bool], candidates: List[Item], label: str = ""
+                            ) -> Tuple[Set[Item], Set[Item]]:
             access_reqs: Set[Item] = set()
             min_reqs: Set[Item] = set()
             counts = Counter(candidates)
 
-            if not target.can_reach(baseline):
+            if not reaches(baseline):
                 # Make a state object with all our candidates collected so we can test if each one is needed
                 state = baseline.copy()
                 for item in candidates:
                     state.collect(item, True)
-                assert target.can_reach(state), f"{target} unreachable with every candidate held"
+                assert reaches(state), f"{label} unreachable with every candidate held"
                 access_reqs = set(counts)
 
                 # Remove all of each item from the state and test if we can still reach the target.
@@ -289,7 +299,7 @@ class ArchiLogicWorld(World):
                     n = counts[item]
                     for _ in range(n):
                         state.remove(item)
-                    if target.can_reach(state):
+                    if reaches(state):
                         access_reqs.discard(item)
                     else:
                         for _ in range(n):
@@ -311,7 +321,7 @@ class ArchiLogicWorld(World):
                 n = counts[item]
                 for _ in range(n):
                     state.remove(item)
-                if not target.can_reach(state):
+                if not reaches(state):
                     min_reqs.add(item)
                 for _ in range(n):
                     state.collect(item, True)
@@ -343,7 +353,8 @@ class ArchiLogicWorld(World):
                 for region in {loc.parent_region for loc in targets}:
                     logging.debug("Determining access requirements for region %s", region.name)
                     if region in region_reqs: continue
-                    region_reqs[region],  region_necessary[region] = get_access_reqs(region, candidates)
+                    region_reqs[region],  region_necessary[region] = get_access_reqs(
+                        region.can_reach, candidates, region.name)
 
                 # Now determine location-specific access rules.
                 for loc in targets:
@@ -358,7 +369,8 @@ class ArchiLogicWorld(World):
                         location_reqs[loc] = base_region_reqs
                         location_necessary[loc] = region_necessary[loc.parent_region]
                     else:
-                        location_reqs[loc], location_necessary[loc] = get_access_reqs(loc, candidates)
+                        location_reqs[loc], location_necessary[loc] = get_access_reqs(
+                            loc.can_reach, candidates, loc.name)
 
         logging.info("Finished calculating access requirements.")
         t3 = time.perf_counter()
@@ -496,6 +508,14 @@ class ArchiLogicWorld(World):
             reqs -= locks_too_much
         t5 = time.perf_counter()
 
+        def is_path_eligible(item) -> bool:
+            """Gate for anything that may appear on a path. Mirrors the filtering applied to
+            hintable_loc_reqs, for requirements derived from profile-defined endpoints."""
+            return (is_hintable(item)
+                    and item_counts[(item.name, item.player)] <= cls.bulk_item_threshold
+                    and not (cls.filter_multi_copy_items and is_multi_copy(item))
+                    and item not in locks_too_much)
+
         # Locate which regions hold each copy of required bulk items.
         # Potentially useful for a bulk item hint like: "Need more Power Stars? Player X's Y region has 4 of them!"
         bulk_by_region: Dict[Item, Counter[Region]] = defaultdict(Counter)
@@ -608,7 +628,9 @@ class ArchiLogicWorld(World):
                 shallow_state_cache[item] = shallow
 
             reqs_for_goal = {i for i in deep_state_cache
-                             if i not in locks_too_much and not is_forced_early(i)}
+                             if i not in locks_too_much and not is_forced_early(i)
+                             and item_counts[(i.name, i.player)] <= cls.bulk_item_threshold}
+
             if not reqs_for_goal:
                 # Everything got filtered — better to report the raw set than nothing.
                 reqs_for_goal = set(deep_state_cache)
@@ -702,6 +724,13 @@ class ArchiLogicWorld(World):
                         break
                     found_endpoints = deeper
 
+            profile = profile_for(multiworld.game[player])
+            adjusted = profile.adjust_endpoints(set(found_endpoints), multiworld, player)
+            if adjusted and adjusted != found_endpoints:
+                logging.info("P%d %s profile adjusted endpoints: %s -> %s", player, profile.game,
+                             sorted(e.name for e in found_endpoints), sorted(e.name for e in adjusted))
+                found_endpoints = adjusted
+
             logging.info("P%d endpoints:       %s", player, sorted(i.name for i in found_endpoints))
             return found_endpoints
 
@@ -719,10 +748,71 @@ class ArchiLogicWorld(World):
 
         # Keep track of any endpoints that don't end up with useful paths to hint
         pathless_endpoints: Dict[int, Dict[Item, Set[Item]]] = defaultdict(dict)
+        profile_dropped: Dict[CustomEndpoint, Set[Item]] = {}
+
+        all_candidates = [loc.item for loc in global_req_locs]
+        all_candidates += [i for i in multiworld.precollected_items[player] if i.advancement]
 
         for player in all_players:
             paths[player] = {}
             player_endpoints[player] = endpoint_items(player, state)
+
+            # CustomEndpoints might have their own rules and need some special case handling.
+            profile_reqs: Dict[CustomEndpoint, Set[Item]] = {}
+            custom_endpoints = [end for end in player_endpoints[player] if isinstance(end, CustomEndpoint)]
+            if custom_endpoints:
+                required_items = [loc.item for loc in global_req_locs]
+                required_items += [item for items in multiworld.precollected_items.values()
+                                   for item in items if item.advancement]
+                all_required_held = baseline.copy()
+                for item in required_items:
+                    all_required_held.collect(item, True)
+
+                for endpoint in custom_endpoints:
+                    # Case 1: CustomEndpoints can have a direct set of required items
+                    wanted_items = set(endpoint.items)
+                    reqs: Set[Item] = {loc.item for loc in multiworld.get_filled_locations()
+                                       if loc.item.player == player and loc.item.name in wanted_items}
+                    if missing := wanted_items - {item.name for item in reqs}:
+                        logging.warning("P%d custom endpoint %r names unknown items: %s",
+                                        player, endpoint.name, sorted(missing))
+
+
+                    # Case 2: CustomEndpoints can have a set of locations that must be accessible
+                    for loc_name in endpoint.locations:
+                        location = next((l for l in multiworld.get_locations(player)
+                                         if l.name == loc_name), None)
+                        if location is None or location not in hintable_loc_reqs:
+                            logging.info("P%d custom endpoint %r names %r, which is unknown or outside "
+                                         "the required set.", player, endpoint.name, loc_name)
+                            continue
+                        reqs |= hintable_loc_reqs[location]
+
+                    # Case 3: CustomEndpoints can have a custom rule.
+                    # This would be a function that takes a CollectionState and returns a bool.
+                    rules = [endpoint.rule] if endpoint.rule is not None else []
+
+                    # Now evaluate all rules, dropping the endpoint if any of them are impossible in this seed.
+                    dropped_endpoint = False
+                    for rule in rules:
+                        if not rule(all_required_held):
+                            logging.warn("P%d dropping custom endpoint %r. Unreachable even holding "
+                                         "every required item.", player, endpoint.name)
+                            player_endpoints[player].discard(endpoint)
+                            dropped_endpoint = True
+                            break
+                        _, necessary = get_access_reqs(rule, required_items, endpoint.name)
+                        if cls.filter_events:
+                            necessary = resolve_event_reqs(necessary, location_necessary, necessary_cache)
+                        reqs |= necessary
+                    if dropped_endpoint:
+                        continue
+
+                    profile_reqs[endpoint] = {i for i in reqs if is_path_eligible(i)}
+                    profile_dropped[endpoint] = reqs - profile_reqs[endpoint]
+                    logging.info("P%d custom endpoint %r: kept %d of %d requirements (dropped: %s)",
+                                 player, endpoint.name, len(profile_reqs[endpoint]), len(reqs),
+                                 sorted(i.name for i in profile_dropped[endpoint]))
 
             # Each endpoint has its own path
             for endpoint in player_endpoints[player]:
@@ -733,7 +823,9 @@ class ArchiLogicWorld(World):
 
                 paths[player][endpoint] = set()
                 path = paths[player][endpoint]
-                endpoint_reqs = hintable_loc_reqs[endpoint.location]
+
+                endpoint_reqs = (profile_reqs[endpoint] if isinstance(endpoint, CustomEndpoint)
+                                 else hintable_loc_reqs[endpoint.location])
 
                 req_stack = list(endpoint_reqs)
                 while req_stack:
@@ -763,6 +855,8 @@ class ArchiLogicWorld(World):
                 if cls.filter_empty_paths and not path:
                     del paths[player][endpoint]
 
+        t6 = time.perf_counter()
+
         # Endpoints with no meaningful path: either nothing gates them at all, or the only
         # things that do are items we deliberately suppress. Either way the player isn't
         # blocked, so they get their own hint. The value is the suppressed gates — empty when
@@ -770,53 +864,80 @@ class ArchiLogicWorld(World):
         if cls.filter_empty_paths:
             for player, eps in player_endpoints.items():
                 for ep in eps:
-                    if ep in paths.get(player, {}) or ep.location is None:
+                    if ep in paths.get(player, {}):
+                        continue
+                    if isinstance(ep, CustomEndpoint):
+                        pathless_endpoints[player][ep] = profile_dropped.get(ep, set())
+                        continue
+                    if ep.location is None:
                         continue
                     raw = necessary_reqs.get(ep.location, set())
                     pathless_endpoints[player][ep] = raw - hintable_loc_reqs.get(ep.location, set())
-        t6 = time.perf_counter()
 
-        # TEMPORARY — dump paths to JSON for offline comparison.
-        dump = {}
-        for player, endpoints in paths.items():
-            dump[str(player)] = {
-                "game": multiworld.game[player],
-                "name": multiworld.player_name[player],
-                "path_sizes": {endpoint.name: len(path)
-                               for endpoint, path in sorted(endpoints.items(), key=lambda kv: kv[0].name)},
-                "paths": {
-                    endpoint.name: [
-                        {
-                            "name": i.name,
-                            "player": i.player,
-                            "is_event": i.is_event,
-                            "location": i.location.name if i.location else None,
-                            "location_player": i.location.player if i.location else None,
-                        }
-                        for i in sorted(path, key=lambda x: (x.player, x.name))
-                    ]
-                    for endpoint, path in sorted(endpoints.items(), key=lambda kv: kv[0].name)
-                },
-            }
+        if cls.dump_profile_reference:
+            reference = {}
+            for player in all_players:
+                world = multiworld.worlds[player]
+                filled = multiworld.get_filled_locations(player)
+                reference[multiworld.player_name[player]] = {
+                    "game": multiworld.game[player],
+                    "player": player,
+                    "events": sorted({loc.item.name for loc in filled if loc.item.code is None}),
+                    "item_name_groups": {group: sorted(names)
+                                         for group, names in sorted(world.item_name_groups.items())},
+                    "location_name_groups": sorted(world.location_name_groups),
+                    "precollected": sorted(i.name for i in multiworld.precollected_items[player]),
+                    "endpoints": {e.name: len(paths.get(player, {}).get(e, ()))
+                                  for e in sorted(player_endpoints[player], key=lambda x: x.name)},
+                    "options": {name: str(getattr(world.options, name).value)
+                                for name in sorted(world.options_dataclass.type_hints)},
+                }
+            reference_path = os.path.join(run_dir, "profile_reference.json")
+            with open(reference_path, "w", encoding="utf-8") as f:
+                json.dump(reference, f, indent=2)
+            logging.info("Wrote %s", reference_path)
 
-        # Stamp the settings that produced this file — two dumps from different flag states are
-        # otherwise indistinguishable. Underscore prefixes can't collide with the player ids.
-        dump["_flags"] = {name: getattr(cls, name) for name in
-                          ("filter_events", "filter_empty_paths", "filter_other_endpoints",
-                           "expand_single_endpoints", "filter_multi_copy_items",
-                           "filter_forced_early", "filter_locks_too_much")}
-        dump["_thresholds"] = {"bulk_item_threshold": cls.bulk_item_threshold,
-                               "locks_too_much_threshold": cls.locks_too_much_threshold}
-        dump["_pathless_endpoints"] = {
-            str(p): {ep.name: sorted(g.name for g in gates) for ep, gates in eps.items()}
-            for p, eps in sorted(pathless_endpoints.items())}
+        if cls.dump_paths:
+            dump = {}
+            for player, endpoints in paths.items():
+                dump[str(player)] = {
+                    "game": multiworld.game[player],
+                    "name": multiworld.player_name[player],
+                    "path_sizes": {endpoint.name: len(path)
+                                   for endpoint, path in sorted(endpoints.items(), key=lambda kv: kv[0].name)},
+                    "paths": {
+                        endpoint.name: [
+                            {
+                                "name": i.name,
+                                "player": i.player,
+                                "is_event": i.is_event,
+                                "location": i.location.name if i.location else None,
+                                "location_player": i.location.player if i.location else None,
+                            }
+                            for i in sorted(path, key=lambda x: (x.player, x.name))
+                        ]
+                        for endpoint, path in sorted(endpoints.items(), key=lambda kv: kv[0].name)
+                    },
+                }
 
-        dump_path = os.path.join(run_dir, "paths.json")
+            # Stamp the settings that produced this file — two dumps from different flag states are
+            # otherwise indistinguishable. Underscore prefixes can't collide with the player ids.
+            dump["_flags"] = {name: getattr(cls, name) for name in
+                              ("filter_events", "filter_empty_paths", "filter_other_endpoints",
+                               "expand_single_endpoints", "filter_multi_copy_items",
+                               "filter_forced_early", "filter_locks_too_much")}
+            dump["_thresholds"] = {"bulk_item_threshold": cls.bulk_item_threshold,
+                                   "locks_too_much_threshold": cls.locks_too_much_threshold}
+            dump["_pathless_endpoints"] = {
+                str(p): {ep.name: sorted(g.name for g in gates) for ep, gates in eps.items()}
+                for p, eps in sorted(pathless_endpoints.items())}
 
-        with open(dump_path, "w", encoding="utf-8") as f:
-            json.dump(dump, f, indent=2, sort_keys=False)
-        logging.info("Wrote %s (%d players, %d paths)", dump_path, len(dump) - 3,
-                     sum(len(p["paths"]) for k, p in dump.items() if not k.startswith("_")))
+            dump_path = os.path.join(run_dir, "paths.json")
+
+            with open(dump_path, "w", encoding="utf-8") as f:
+                json.dump(dump, f, indent=2, sort_keys=False)
+            logging.info("Wrote %s (%d players, %d paths)", dump_path, len(dump) - 3,
+                         sum(len(p["paths"]) for k, p in dump.items() if not k.startswith("_")))
 
         logging.info("ArchiLogic timings: build-spheres %.2fs  prune-spheres %.2fs  rebuild-spheres %.2fs  "
                      "required-locs %.2fs  access-reqs %.2fs  resolve-events %.2fs  filters %.2fs  "
@@ -944,13 +1065,3 @@ class ArchiLogicWorld(World):
 
         logging.getLogger().removeHandler(run_log)
         run_log.close()
-
-        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # Build up the logical backing for our hints:
-        # WOTH and Path hints -> Determine critical path and each location on the path's requirements, and what's "hintable"
-        # Region hints -> Determine amount of woth items in each region, give hints on woth and/or foolish regions
-        # Who has my item? -> Maintain player links for locations. Like built in hints but less direct.
-        #                  -> Can also hint region for item to point players in the right direction without "spoiling"
-        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

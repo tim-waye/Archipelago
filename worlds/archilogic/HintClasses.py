@@ -2,7 +2,21 @@ import logging
 from enum import StrEnum
 from typing import Dict, Tuple, Set
 
-from BaseClasses import Item
+from BaseClasses import Item, Region, Location
+from worlds.archilogic.errors import ArchiLogicError
+from worlds.archilogic.games import GameProfile, profile_for, DEFAULT
+
+_player_profiles: Dict[int, GameProfile] = {}
+
+def set_player_profiles(games: Dict[int, str]) -> None:
+    _player_profiles.clear()
+    _player_profiles.update({player: profile_for(game) for player, game in games.items()})
+
+# If any game has set display names in their profile use those.
+# If they don't have a profile we default to hint_text, then name.
+def get_display_name(obj: Item | Location | Region) -> str:
+    profile = _player_profiles.get(obj.player, DEFAULT)
+    return profile.display_name(obj) or obj.hint_text or obj.name
 
 class Directness(StrEnum):
     Item = "item"
@@ -15,11 +29,8 @@ class HintType(StrEnum):
     SinglePath = "single_path"
     MultiPath = "multi_path"
 
-class ArchiLogicError(RuntimeError):
-    pass
-
 def flatten_item(item: Item) -> dict:
-    return {"name": item.name, "id": item.code, "player": item.player}
+    return {"name": get_display_name(item), "id": item.code, "player": item.player}
 
 class Hint:
     hint_type: HintType
@@ -90,7 +101,7 @@ class SinglePathHint(Hint):
         self.hint_type = HintType.SinglePath
 
         # Write hint text. First half of the string is already initialized in the super constructor
-        self.hint_text = f"{self.subject_text}is on the Path to {endpoint.name}."
+        self.hint_text = f"{self.subject_text}is on the Path to {get_display_name(endpoint)}."
 
     def to_slot_data(self) -> dict:
         slot_data = super().to_slot_data()
@@ -111,7 +122,8 @@ class MultiPathHint(Hint):
         # Write hint text. First half of the string is already initialized in the super constructor
         end_list = []
         for (_, player), ends in endpoints.items():
-            end_list.append(f"{concat_list([end.name for end in sorted(ends)], ',', True)} for {player}")
+            end_names = sorted(get_display_name(end) for end in ends)
+            end_list.append(f"{concat_list(end_names, ',', True)} for {player}")
 
         end_str = f"is on the Path to {concat_list(sorted(end_list), ';', True)}"
         self.hint_text = f"{self.subject_text}{end_str}."
@@ -121,7 +133,7 @@ class MultiPathHint(Hint):
         slot_data["endpoints"] = [
             flatten_item(e)
             for _, ends in sorted(self.endpoints.items())
-            for e in sorted(ends, key=lambda x: x.name)
+            for e in sorted(ends, key=get_display_name)
         ]
         return slot_data
 
@@ -137,18 +149,18 @@ def write_item_hint_text(item, directness) -> Tuple[str, Directness]:
         direct = Directness.Item
     match direct:
         case Directness.Item:
-            return f"{item.hint_text} ", direct
+            return f"{get_display_name(item)} ", direct
         case Directness.Location:
             if item.location:
-                return f"Something on {item.location.name} ", direct
+                return f"Something on {get_display_name(item.location)} ", direct
             else:
                 raise ArchiLogicError("Tried to make a Location path hint for an item with no location")
         case Directness.Region:
             if item.location and item.location.parent_region:
-                return f"Something in {item.location.parent_region.hint_text} ", direct
+                return f"Something in {get_display_name(item.location.parent_region)} ", direct
             else:
                 raise ArchiLogicError("Tried to make a Region path hint for an item with no parent region")
-    raise ArchiLogicError(f"Unable to write hint text for item: {item.name}")
+    raise ArchiLogicError(f"Unable to write hint text for item: {get_display_name(item)}")
 
 def concat_list(parts: list[str], delimiter: str, oxford: bool) -> str:
     if not parts:
