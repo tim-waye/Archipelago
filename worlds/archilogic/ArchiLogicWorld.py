@@ -9,6 +9,7 @@ from collections import Counter, defaultdict
 import math
 
 from BaseClasses import CollectionState, Location, Item, ItemClassification, DEFAULT_COLLECTION_RULE, Region
+from NetUtils import convert_to_base_types
 from Options import OptionError
 from worlds.AutoWorld import World
 from worlds.archilogic.HintClasses import MultiPathHint, Directness, SinglePathHint, WothHint, Hint, set_player_profiles
@@ -99,11 +100,20 @@ class ArchiLogicWorld(World):
     create_single_paths = False
     create_multi_paths = True
 
+    # Flag for building item_requirements for the hint_towards command
+    build_item_requirements = True
+
     hints_per_player = 20
     selected_hints: List[Hint] = []
+    location_graph: List[dict] = []
+    starting_items: Dict[str, Dict[str, int]] = {}
 
     def fill_slot_data(self) -> Dict[str, Any]:
-        return {"hints": [h.to_slot_data() for h in self.selected_hints]}
+        return {
+            "hints": [hint.to_slot_data() for hint in self.selected_hints],
+            "locations": self.location_graph,
+            "starting_items": self.starting_items,
+        }
 
     @classmethod
     def stage_pre_output(cls, multiworld):
@@ -203,6 +213,16 @@ class ArchiLogicWorld(World):
             required_locations -= sphere
             if not sphere:
                 raise RuntimeError(f'Not all required items reachable. Unreachable locations: {required_locations}')
+
+        # Which sphere each item first becomes obtainable in. Used to resolve either/ors toward
+        # the branch that opens earliest, rather than whatever Item.__lt__ happens to sort first.
+        # setdefault keeps the earliest sphere for multi-copy items, since Item hashes on
+        # (name, player) and all copies collapse to one key.
+        item_sphere_depth: Dict[Item, int] = {}
+        for depth, sphere in enumerate(collection_spheres):
+            for location in sphere:
+                item_sphere_depth.setdefault(location.item, depth)
+
         logging.info("Finished calculating collection_spheres for ArchiLogic.")
         t1 = time.perf_counter()
 
@@ -295,7 +315,10 @@ class ArchiLogicWorld(World):
                 # Remove all of each item from the state and test if we can still reach the target.
                 # If so we discard the item(s) from our needed set, because they aren't needed.
                 # If removing them means we can't reach the target anymore we re-collect them and keep them in the needed set
-                for item in sorted(counts):
+                # Discard the latest-available items first, so what survives is the branch that
+                # opens earliest. Precollected items default to -1 and are tested last, which is
+                # right — they're free, so keeping them is always the cheaper route.
+                for item in sorted(counts, key=lambda i: (-item_sphere_depth.get(i, -1), i.name)):
                     n = counts[item]
                     for _ in range(n):
                         state.remove(item)
@@ -857,6 +880,76 @@ class ArchiLogicWorld(World):
 
         t6 = time.perf_counter()
 
+        # We need item_requirements to build our backing logic for the /hint_towards command.
+        if cls.build_item_requirements:
+            requirements_start = time.perf_counter()
+
+            def copies_required(target_location, loc_requirements, available_items) -> Counter:
+                """
+                How many copies of each requirement the target location actually needs.
+                This scan accounts for items with multiple copies (think Progressive Strength from OOT)
+                We do this by binary searching on the total amount of copies to determine exactly how many copies
+                a specific location requires. This is also needed to determine when multiple copies of an item
+                create an either/or situation, where multiple copies are equally valid options for progression.
+                """
+                available_copies = Counter(available_items)
+                required_copies = Counter()
+
+                for req in loc_requirements:
+                    total_copies = available_copies[req]
+                    if total_copies <= 1:
+                        required_copies[req] = 1
+                        continue
+
+                    state_without_reqs = baseline.copy()
+                    for item in available_items:
+                        if item != req:
+                            state_without_reqs.collect(item, True)
+
+                    fewest, most = 1, total_copies
+                    while fewest < most:
+                        trial_count = (fewest + most) // 2
+                        probe_state = state_without_reqs.copy()
+                        for _ in range(trial_count):
+                            probe_state.collect(req, True)
+                        if target_location.can_reach(probe_state):
+                            most = trial_count
+                        else:
+                            fewest = trial_count + 1
+                    required_copies[req] = fewest
+
+                return required_copies
+
+            all_available_items = [loc.item for loc in global_req_locs]
+            all_available_items += [item for items in multiworld.precollected_items.values()
+                                    for item in items if item.advancement]
+
+            # Keyed by location, not by item. Sphere ordering guarantees a location only requires
+            # items from earlier spheres, which makes the graph acyclic — but that holds per
+            # location, not per item type. Collapsing copies lets a deep copy's requirements stand
+            # in for a shallow one, which closes cycles: Sublime Bone Dust -> King's Ring ->
+            # Strength Upgrade -> Lens of Truth -> Sublime Bone Dust.
+            location_req_counts: Dict[Location, Counter] = {}
+            location_contents: Dict[Location, Item] = {}
+
+            for location in global_req_locs:
+                if location.item is None:
+                    continue
+                location_contents[location] = location.item
+                location_req_counts[location] = copies_required(location,
+                                                                resolved_loc_reqs.get(location, set()),
+                                                                all_available_items)
+
+            # Precollected items have no location, so they're the client's starting state rather
+            # than nodes in the graph.
+            starting_items: Dict[int, Counter] = {
+                player: Counter(item.name for item in items if item.advancement)
+                for player, items in multiworld.precollected_items.items()
+            }
+
+            logging.info("Built location requirements in %.2fs: %d locations",
+                         time.perf_counter() - requirements_start, len(location_req_counts))
+
         # Endpoints with no meaningful path: either nothing gates them at all, or the only
         # things that do are items we deliberately suppress. Either way the player isn't
         # blocked, so they get their own hint. The value is the suppressed gates — empty when
@@ -896,6 +989,30 @@ class ArchiLogicWorld(World):
             with open(reference_path, "w", encoding="utf-8") as f:
                 json.dump(reference, f, indent=2)
             logging.info("Wrote %s", reference_path)
+
+        if cls.build_item_requirements:
+            def item_key(item: Item) -> str:
+                return f"{item.name} (P{item.player})"
+
+            requirements_dump = {
+                "locations": {
+                    f"{location.name} (P{location.player})": {
+                        "item": item_key(location_contents[location]),
+                        "world": location.player,
+                        "requires": {item_key(req): count for req, count in requirements.items()},
+                    }
+                    for location, requirements in sorted(location_req_counts.items(),
+                                                         key=lambda kv: (kv[0].player, kv[0].name))
+                },
+                "starting_items": {str(player): dict(items)
+                                   for player, items in starting_items.items()},
+            }
+
+            requirements_path = os.path.join(run_dir, "item_requirements.json")
+            with open(requirements_path, "w", encoding="utf-8") as f:
+                json.dump(requirements_dump, f, indent=2)
+            logging.info("Wrote %s (%d bytes)", requirements_path,
+                         os.path.getsize(requirements_path))
 
         if cls.dump_paths:
             dump = {}
@@ -1055,6 +1172,25 @@ class ArchiLogicWorld(World):
                     woth_num -= 1
         archilogic_world.selected_hints = selected_hints
 
+        if cls.build_item_requirements:
+            archilogic_world.location_graph = [
+                {
+                    "name": location.name,
+                    "world": location.player,
+                    "address": location.address,          # None for events — not a real check
+                    "item": [location_contents[location].name, location_contents[location].player],
+                    "requires": [[requirement.name, requirement.player, count]
+                                 for requirement, count in sorted(
+                                     requirements.items(), key=lambda kv: (kv[0].player, kv[0].name))],
+                }
+                for location, requirements in sorted(location_req_counts.items(),
+                                                     key=lambda kv: (kv[0].player, kv[0].name))
+            ]
+            archilogic_world.starting_items = {str(player): dict(items)
+                                               for player, items in starting_items.items()}
+
+            logging.info("slot_data payload: %d bytes",
+                         len(json.dumps(convert_to_base_types(archilogic_world.fill_slot_data()))))
 
         logging.info("Hint-Building timing =  %.2fs",t8 - t7)
         logging.info(f"Hints built: "
@@ -1062,6 +1198,11 @@ class ArchiLogicWorld(World):
                      f"{'\n\t- Specific Woth Hints' if cls.create_specific_woths else ''}"
                      f"{'\n\t- Single Path Hints' if cls.create_single_paths else ''}"
                      f"{'\n\t- Multi Path Hints' if cls.create_multi_paths else ''}")
+
+        logging.info("either/or locations: %d total, %d on paths",
+                     len(either_or_locs),
+                     len({i.location for p in paths.values() for path in p.values()
+                          for i in path if i.location in either_or_locs}))
 
         logging.getLogger().removeHandler(run_log)
         run_log.close()
