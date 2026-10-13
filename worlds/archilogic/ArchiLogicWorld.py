@@ -1,3 +1,5 @@
+import heapq
+import itertools
 import json
 import logging
 import os
@@ -12,7 +14,9 @@ from BaseClasses import CollectionState, Location, Item, ItemClassification, DEF
 from NetUtils import convert_to_base_types
 from Options import OptionError
 from worlds.AutoWorld import World
-from worlds.archilogic.HintClasses import MultiPathHint, Directness, SinglePathHint, WothHint, Hint, set_player_profiles
+from worlds.archilogic.HintClasses import (MultiPathHint, Directness, SinglePathHint, WothHint, Hint,
+                                           set_player_profiles, Certainty, CERTAINTY_RANK, PathMember, get_display_name)
+from worlds.archilogic.errors import ArchiLogicError
 from worlds.archilogic.games import GameProfile, profile_for, CustomEndpoint
 
 
@@ -31,11 +35,6 @@ class ArchiLogicWorld(World):
     # TODO make these overrideable from options in the yaml. Per game preferably
     bulk_item_threshold = 6
     locks_too_much_threshold = 50
-    hintable_item_classes = [
-        ItemClassification.progression,
-        ItemClassification.progression_skip_balancing,
-        ItemClassification.progression_deprioritized_skip_balancing,
-    ]
 
     # Debug artifacts written into the per-run analysis directory.
     dump_paths = True                # endpoint paths — the main tuning artifact
@@ -103,7 +102,14 @@ class ArchiLogicWorld(World):
     # Flag for building item_requirements for the hint_towards command
     build_item_requirements = True
 
+    # Economy. hint_cost and location_check_points are host settings chosen when the room
+    # is launched, not at generation, so ArchiLogic paces against each player's own
+    # location count instead: one hint per grant_percent of their checks.
     hints_per_player = 20
+    grant_percent = 3
+    toward_percent = 5
+    location_counts: Dict[str, int] = {}
+
     selected_hints: List[Hint] = []
     location_graph: List[dict] = []
     starting_items: Dict[str, Dict[str, int]] = {}
@@ -113,6 +119,12 @@ class ArchiLogicWorld(World):
             "hints": [hint.to_slot_data() for hint in self.selected_hints],
             "locations": self.location_graph,
             "starting_items": self.starting_items,
+            "bulk_item_threshold": self.bulk_item_threshold,
+            "location_counts": self.location_counts,
+            "hint_economy": {
+                "grant_percent": self.grant_percent,
+                "toward_percent": self.toward_percent,
+            },
         }
 
     @classmethod
@@ -154,6 +166,23 @@ class ArchiLogicWorld(World):
         state_cache: List[Optional[CollectionState]] = [None]
         state = CollectionState(multiworld)
         sphere_candidates = set(prog_locations)
+
+        # Some apworlds create a second, code-less copy of an item to seed a progressive chain.
+        # Ship of Harkinian precollects event copies of Progressive Scale, Stick Capacity, Nut
+        # Capacity and Wallet when their shuffle option is off, so the first real copy upgrades
+        # you to the second tier instead of the first. Item hashes on (name, player), so those
+        # collapse onto the real copies and a requirement set holds whichever was inserted first.
+        # Anything reading a per-instance attribute — code, location, is_event — needs the placed
+        # copy, not whichever instance the set happened to capture.
+        canonical_items: Dict[Item, Item] = {}
+        for loc in multiworld.get_filled_locations():
+            if not loc.item.is_event:
+                canonical_items.setdefault(loc.item, loc.item)
+
+        def canonical(item: Item) -> Item:
+            """The placed copy of this item. Falls back to the given instance for genuine events
+            and items that exist only in someone's starting inventory."""
+            return canonical_items.get(item, item)
 
         # Data sets we'll build hints from later
         collection_spheres: List[Set[Location]] = []
@@ -223,6 +252,13 @@ class ArchiLogicWorld(World):
             for location in sphere:
                 item_sphere_depth.setdefault(location.item, depth)
 
+        # Which sphere each location opens in. Choosing between copies of one item needs
+        # per-location depth, which the item-keyed map above can't express.
+        location_sphere_depth: Dict[Location, int] = {}
+        for depth, sphere in enumerate(collection_spheres):
+            for location in sphere:
+                location_sphere_depth[location] = depth
+
         logging.info("Finished calculating collection_spheres for ArchiLogic.")
         t1 = time.perf_counter()
 
@@ -268,15 +304,6 @@ class ArchiLogicWorld(World):
             for item in items:
                 if item.advancement: baseline.remove(item)
 
-        # Also need to handle the edge case of items that have multiple copies with the same name.
-        # How many copies of each item exist anywhere in the multiworld, starting inventory included.
-        # item_counts = Counter((loc.item.name, loc.item.player) for loc in multiworld.get_filled_locations())
-        # item_counts += Counter((i.name, i.player) for items in multiworld.precollected_items.values()
-        #                        for i in items if i.advancement)
-        def is_multi_copy(item):
-            """This item has multiple copies, but not enough to be treated as a bulk item"""
-            return 1 < item_counts[(item.name, item.player)] <= cls.bulk_item_threshold
-
         # Here's where things get interesting. This function returns two sets of items for each location:
         # - access_reqs: a minimum viable set of items needed to access the given location or region
         # - min_reqs: a subset of access_reqs containing only items that we can guarantee are required
@@ -292,12 +319,11 @@ class ArchiLogicWorld(World):
         # So in this case access_reqs has two valid values: {Chest Key, Bombs} or {Chest Key, Gem, Orb}
         # But, min_reqs will only be the item that is known to ALWAYS be required: {Chest Key}
         #
-        # Due to the algorithm I'm using, if an access_reqs set does contain an either/or, it will only have the last
-        # valid set that it tested.
-        # But, the whole reason to call out these either/ors is because they make hints confusing, so our solution will
-        # be to simply not give hints for items only used in either/or situations. So it's unnecessary (at this point)
-        # to calculate every potential set of optional items for each either/or, since ultimately we're going to trim
-        # them out anyway.
+        # If an access_reqs set does contain an either/or, we only end up keeping one of the valid combinations.
+        # Which one isn't arbitrary though — we test the latest-available items for removal first, so whatever
+        # survives is the branch that opens earliest. That's the route a player is most likely to take anyway.
+        # We don't need to enumerate every possible combination, because we're not trying to hide the either/or
+        # anymore. The items this route picked that min_reqs didn't get flagged as uncertain later. (Step Four.)
         def get_access_reqs(reaches: Callable[[CollectionState], bool], candidates: List[Item], label: str = ""
                             ) -> Tuple[Set[Item], Set[Item]]:
             access_reqs: Set[Item] = set()
@@ -438,21 +464,24 @@ class ArchiLogicWorld(World):
             {r: resolve_event_reqs(region_necessary[r], location_necessary, necessary_cache)
              for r in region_necessary}
 
-        # Now we can most efficiently calculate the locs/regions that have either/or requirements,
-        # as well as determine which sets of items are used in these either/ors.
+        # Now we can most efficiently calculate which locations have either/or requirements, and which items only
+        # ever show up in one.
         #
-        # Because of the nature of either/ors, we can't definitively say one of those combinations is required over any
-        # other. We also can't say all of them are required because that's untrue and would be a misleading hint.
-        # So the policy is to strip either/or items from paths entirely.
+        # Remember that access_reqs is one route that works, while min_reqs is only what EVERY route needs. So the
+        # difference between the two is exactly the set of items this particular route happened to pick. Back to our
+        # temple: access_reqs might be {Chest Key, Bombs}, min_reqs is {Chest Key}, so the Bombs are the either/or.
         #
-        # Instead we'll try to give more priority to hinting the LOCATION that has the either/or requirements gating it.
-        # A player who knows their game well should know which locations have multiple ways to access them. And being
-        # told they'll have to figure out a way in is more interesting and useful than being handed one arbitrary route.
+        # I used to strip these off of paths entirely, since saying "the Bombs are required" is a lie when the wizard
+        # would have worked just as well. But that threw away real information, because the Bombs ARE required on the
+        # route we actually walked. So now the walk keeps them and labels them instead. Anything that's necessary at
+        # the location which pulled it in stays Certainty.Necessary, and anything this route merely chose gets demoted
+        # to Certainty.Route. (See walk_requirements for where that happens.)
         #
-        # So for our temple example, say that locked chest holds a magical sword which is required to beat the end boss.
-        # We could potentially have a hint saying "The Chest Key is on the path to your Magical Sword", so players will
-        # know they need to enter the temple. But they would NOT receive hints saying the Bombs, Gem, or Orb are on the
-        # path to the Magical Sword. (Unless of course those items ALSO gate some other required item on the path!)
+        # So our temple's Chest Key is Necessary and the Bombs are Route. We can hint either one, but only the Chest
+        # Key can be stated as unavoidable.
+        #
+        # What's left below is just a diagnostic now. The tally at the end of the run reports how many either/or
+        # locations we found and how many of them ended up on a path.
         either_or_locs: Dict[Location, Set[Item]] = {}
         for loc in resolved_loc_reqs:
             known_either_or_items = resolved_loc_reqs[loc] - resolved_loc_necessary[loc]
@@ -466,6 +495,112 @@ class ArchiLogicWorld(World):
                 either_or_regions[reg] = known_either_or_items
         t4 = time.perf_counter()
 
+        # Step Five-and-a-half: the location requirement graph that paths and /hint_toward share.
+        #
+        # Built from access_reqs, not min_reqs. min_reqs holds only what's required under EVERY
+        # route, so slack destroys it — an endpoint gated by "50 of 80 Dragons" has no necessary
+        # requirements at all, and used to yield a path of one item. access_reqs is one complete
+        # viable route, which always exists. min_reqs is kept, as the certainty tier.
+        requirements_start = time.perf_counter()
+
+        def copies_required(target_location, loc_requirements, available_items) -> Counter:
+            """
+            How many copies of each requirement the target location actually needs.
+            This scan accounts for items with multiple copies (think Progressive Strength from OOT)
+            We do this by binary searching on the total amount of copies to determine exactly how many copies
+            a specific location requires. This is also needed to determine when multiple copies of an item
+            create an either/or situation, where multiple copies are equally valid options for progression.
+            """
+            available_copies = Counter(available_items)
+            required_copies = Counter()
+
+            for req in loc_requirements:
+                total_copies = available_copies[req]
+                if total_copies <= 1:
+                    required_copies[req] = 1
+                    continue
+
+                state_without_reqs = baseline.copy()
+                for item in available_items:
+                    if item != req:
+                        state_without_reqs.collect(item, True)
+
+                fewest, most = 1, total_copies
+                while fewest < most:
+                    trial_count = (fewest + most) // 2
+                    probe_state = state_without_reqs.copy()
+                    for _ in range(trial_count):
+                        probe_state.collect(req, True)
+                    if target_location.can_reach(probe_state):
+                        most = trial_count
+                    else:
+                        fewest = trial_count + 1
+                required_copies[req] = fewest
+
+            return required_copies
+
+        all_available_items = [loc.item for loc in global_req_locs]
+        all_available_items += [item for items in multiworld.precollected_items.values()
+                                for item in items if item.advancement]
+
+        # Keyed by location, not by item. Sphere ordering guarantees a location only requires
+        # items from earlier spheres, which makes the graph acyclic — but that holds per
+        # location, not per item type. Collapsing copies lets a deep copy's requirements stand
+        # in for a shallow one, which closes cycles: Sublime Bone Dust -> King's Ring ->
+        # Strength Upgrade -> Lens of Truth -> Sublime Bone Dust.
+        location_req_counts: Dict[Location, Counter] = {}
+        location_contents: Dict[Location, Item] = {}
+
+        for location in global_req_locs:
+            if location.item is None:
+                continue
+            location_contents[location] = location.item
+            location_req_counts[location] = Counter(
+                {canonical(req): count for req, count
+                 in copies_required(location, resolved_loc_reqs.get(location, set()),
+                                    all_available_items).items()})
+
+        # Precollected items have no location, so they're the client's starting state rather
+        # than nodes in the graph.
+        starting_items: Dict[int, Counter] = {
+            player: Counter(item.name for item in items if item.advancement)
+            for player, items in multiworld.precollected_items.items()
+        }
+
+        # Every location holding a copy of each item, cheapest sphere first.
+        item_holders: Dict[Item, List[Location]] = defaultdict(list)
+        for location, item in location_contents.items():
+            item_holders[item].append(location)
+        for locations in item_holders.values():
+            locations.sort(key=lambda loc: (location_sphere_depth.get(loc, len(collection_spheres)),
+                                            loc.player, loc.name))
+
+        # Precollected copies are free: already held, and they cost no path to reach.
+        free_copies: Counter[Item] = Counter()
+        for items in multiworld.precollected_items.values():
+            for item in items:
+                if item.advancement:
+                    free_copies[item] += 1
+
+        graph_copies: Counter[Item] = Counter(free_copies)
+        for item in location_contents.values():
+            graph_copies[item] += 1
+
+        def cheapest_holders(item, count) -> List[Location]:
+            """The locations holding the `count` cheapest copies. Precollected copies come first,
+            so only the shortfall needs locations.
+
+            Counting them is required for soundness, not an optimisation: skipping them reaches
+            past a starting copy into a deeper one and invents a dependency the route doesn't
+            have. Measured on a 5-game seed, 13 of 200 N-of-M gates were wrong without it, all
+            Progressive Wallet — 2 holder locations plus 1 starting copy, so a sphere-zero shop
+            that needs one wallet got told it needed a sphere-one location."""
+            shortfall = count - free_copies[item]
+            return item_holders[item][:shortfall] if shortfall > 0 else []
+
+        logging.info("Built location requirements in %.2fs: %d locations",
+                     time.perf_counter() - requirements_start, len(location_req_counts))
+
         # Step Five: Determine which items and location are worth giving hints for.
 
         def is_forced_early(item):
@@ -473,29 +608,6 @@ class ArchiLogicWorld(World):
                 return False
             return (item.name in multiworld.early_items.get(item.player, {})
                     or item.name in multiworld.local_early_items.get(item.player, {}))
-
-        def is_hintable(item):
-            return ((not cls.filter_events or not item.is_event)
-                    and (item.classification in cls.hintable_item_classes)
-                    and item.name not in multiworld.worlds[item.player].hint_blacklist
-                    and not is_forced_early(item))
-
-        hintable_loc_reqs: Dict[Location, Set[Item]] = defaultdict(set)
-        required_bulk: Set[Tuple[str, int]] = set()
-
-        necessary_reqs = resolved_loc_necessary if cls.filter_events else location_necessary
-        for loc, items in necessary_reqs.items():
-            for item in items:
-                if not is_hintable(item):
-                    continue
-                if item_counts[(item.name, item.player)] > cls.bulk_item_threshold:
-                    # Required bulk items may earn a region hint, tracked separately below.
-                    required_bulk.add((item.name, item.player))
-                    continue
-                if cls.filter_multi_copy_items and is_multi_copy(item):
-                    # For now, treat copies of one item as an either/or with each other.
-                    continue
-                hintable_loc_reqs[loc].add(item)
 
         # Some games have single items that lock off a large percentage of their checks. This makes the item so
         # ubiquitous that in most seeds it would end up on any path that has any of its items in that game. Thus making
@@ -505,46 +617,80 @@ class ArchiLogicWorld(World):
         for loc in multiworld.get_filled_locations():
             everything.collect(loc.item, True)
 
-        candidates_by_player: Dict[int, Set[Item]] = defaultdict(set)
-        for reqs in hintable_loc_reqs.values():
-            for item in reqs:
-                candidates_by_player[item.player].add(item)
+        # Expensive: O(items × locations) can_reach calls. Lazy and memoized so it only runs
+        # for items that pass every cheaper gate.
+        reachable_by_player: Dict[int, List[Location]] = {}
+        locks_cache: Dict[Tuple[str, int], bool] = {}
 
-        locks_too_much: Set[Item] = set()
-        if cls.filter_locks_too_much:
-            for gate_player, candidates in candidates_by_player.items():
-                reachable = [loc for loc in multiworld.get_locations(gate_player)
-                             if loc.can_reach(everything)]
+        def locks_too_much(item) -> bool:
+            if not cls.filter_locks_too_much:
+                return False
+            key = (item.name, item.player)
+            if key not in locks_cache:
+                reachable = reachable_by_player.get(item.player)
+                if reachable is None:
+                    reachable = [loc for loc in multiworld.get_locations(item.player)
+                                 if loc.can_reach(everything)]
+                    reachable_by_player[item.player] = reachable
                 if not reachable:
-                    continue
-                for item in candidates:
+                    locks_cache[key] = False
+                else:
                     probe = everything.copy()
                     probe.remove(item)
                     locked = sum(1 for loc in reachable if not loc.can_reach(probe))
-                    if 100 * locked / len(reachable) >= cls.locks_too_much_threshold:
-                        locks_too_much.add(item)
+                    locks_cache[key] = 100 * locked / len(reachable) >= cls.locks_too_much_threshold
+            return locks_cache[key]
 
-        logging.debug("Excluded because it locks too much of someone's game: %s",
-                     sorted(f"{i.name} (P{i.player})" for i in locks_too_much))
+        # An item is refused at some locations and admitted at others — Progressive Hookshot is
+        # interchangeable at 37 locations and nameable at 4 — so a refusal only matters when the
+        # item is never admitted anywhere.
+        refusals: Dict[Tuple[str, int], Set[str]] = defaultdict(set)
+        admitted: Set[Tuple[str, int]] = set()
 
-        for reqs in hintable_loc_reqs.values():
-            reqs -= locks_too_much
+        def is_path_member(item, count) -> bool:
+            """Structurally a dependency of this route. Traversal is separate again — bulk gates
+            are walked through without being members."""
+            def refuse(reason):
+                refusals[(item.name, item.player)].add(reason)
+                return False
+
+            total = item_counts[(item.name, item.player)]
+            canon = canonical(item)
+            if not canon.advancement:
+                return refuse(f"classification {canon.classification.name}")
+            if canon.location is None:
+                return refuse("precollected")
+            if cls.filter_multi_copy_items and 1 < total and count < total:
+                return refuse(f"N of M (needs {count} of {total})")
+            return True
+
+        def is_hintable(item, record: bool = True) -> bool:
+            """Eligible to be the subject of a hint. Presupposes membership. Count-independent,
+            since the bulk gate keys off the total rather than what this route needs."""
+            def refuse(reason):
+                if record:
+                    refusals[(item.name, item.player)].add(reason)
+                return False
+
+            total = item_counts[(item.name, item.player)]
+            canon = canonical(item)
+            if cls.filter_events and canon.is_event:
+                return refuse("event")
+            if canon.name in multiworld.worlds[canon.player].hint_blacklist:
+                return refuse("hint_blacklist")
+            if is_forced_early(canon):
+                return refuse("forced_early")
+            if profile_for(canon.game).item_is_excluded(multiworld, canon.name):
+                return refuse("profile_excluded")
+            if total > cls.bulk_item_threshold:
+                return refuse(f"bulk ({total} copies > {cls.bulk_item_threshold})")
+            if locks_too_much(canon):
+                return refuse("locks_too_much")
+            if record:
+                admitted.add((canon.name, canon.player))
+            return True
+
         t5 = time.perf_counter()
-
-        def is_path_eligible(item) -> bool:
-            """Gate for anything that may appear on a path. Mirrors the filtering applied to
-            hintable_loc_reqs, for requirements derived from profile-defined endpoints."""
-            return (is_hintable(item)
-                    and item_counts[(item.name, item.player)] <= cls.bulk_item_threshold
-                    and not (cls.filter_multi_copy_items and is_multi_copy(item))
-                    and item not in locks_too_much)
-
-        # Locate which regions hold each copy of required bulk items.
-        # Potentially useful for a bulk item hint like: "Need more Power Stars? Player X's Y region has 4 of them!"
-        bulk_by_region: Dict[Item, Counter[Region]] = defaultdict(Counter)
-        for loc in multiworld.get_filled_locations():
-            if (loc.item.name, loc.item.player) in required_bulk:
-                bulk_by_region[loc.item][loc.parent_region] += 1
 
         # Returns a dict of item name to item for every required or precollected item for the given player
         def items_by_name(player):
@@ -651,7 +797,7 @@ class ArchiLogicWorld(World):
                 shallow_state_cache[item] = shallow
 
             reqs_for_goal = {i for i in deep_state_cache
-                             if i not in locks_too_much and not is_forced_early(i)
+                             if (i.is_event or not locks_too_much(i)) and not is_forced_early(i)
                              and item_counts[(i.name, i.player)] <= cls.bulk_item_threshold}
 
             if not reqs_for_goal:
@@ -737,10 +883,8 @@ class ArchiLogicWorld(World):
                     for req in location_necessary.get(item.location, ()):
                         copies = item_counts[(req.name, req.player)]
                         if (req.is_event
-                                or (is_hintable(req)
-                                    and copies <= cls.bulk_item_threshold
-                                    and not (cls.filter_multi_copy_items and copies > 1)
-                                    and req not in locks_too_much)):
+                                or (is_hintable(req, record=False)
+                                    and not (cls.filter_multi_copy_items and copies > 1))):
                             deeper.add(req)
                     deeper.discard(item)
                     if not deeper:
@@ -760,10 +904,7 @@ class ArchiLogicWorld(World):
         # Oh boy, finally time to build our paths!
         player_endpoints = {}
         go_mode_items: Dict[int, Set[Item]] = {}
-
-        # Each player has one path per endpoint. The path is the set of all hintable items across the multiworld that
-        # are required to unlock the endpoint.
-        paths: Dict[int, Dict[Item, Set[Item]]] = {}
+        paths: Dict[int, Dict[Item, PathMember]] = {}
 
         # Keep track of which paths each item is on. This will be used to give path/multi-path hints.
         # The hints will be structured in some form of: "This item is on the path to these endpoints"
@@ -776,12 +917,13 @@ class ArchiLogicWorld(World):
         all_candidates = [loc.item for loc in global_req_locs]
         all_candidates += [i for i in multiworld.precollected_items[player] if i.advancement]
 
+        # CustomEndpoints might have their own rules and need some special case handling.
+        profile_reqs: Dict[CustomEndpoint, Set[Item]] = {}
+
         for player in all_players:
             paths[player] = {}
             player_endpoints[player] = endpoint_items(player, state)
 
-            # CustomEndpoints might have their own rules and need some special case handling.
-            profile_reqs: Dict[CustomEndpoint, Set[Item]] = {}
             custom_endpoints = [end for end in player_endpoints[player] if isinstance(end, CustomEndpoint)]
             if custom_endpoints:
                 required_items = [loc.item for loc in global_req_locs]
@@ -805,11 +947,11 @@ class ArchiLogicWorld(World):
                     for loc_name in endpoint.locations:
                         location = next((l for l in multiworld.get_locations(player)
                                          if l.name == loc_name), None)
-                        if location is None or location not in hintable_loc_reqs:
+                        if location is None or location not in location_req_counts:
                             logging.info("P%d custom endpoint %r names %r, which is unknown or outside "
                                          "the required set.", player, endpoint.name, loc_name)
                             continue
-                        reqs |= hintable_loc_reqs[location]
+                        reqs |= set(location_req_counts.get(location, Counter()))
 
                     # Case 3: CustomEndpoints can have a custom rule.
                     # This would be a function that takes a CollectionState and returns a bool.
@@ -831,10 +973,10 @@ class ArchiLogicWorld(World):
                     if dropped_endpoint:
                         continue
 
-                    profile_reqs[endpoint] = {i for i in reqs if is_path_eligible(i)}
-                    profile_dropped[endpoint] = reqs - profile_reqs[endpoint]
-                    logging.info("P%d custom endpoint %r: kept %d of %d requirements (dropped: %s)",
-                                 player, endpoint.name, len(profile_reqs[endpoint]), len(reqs),
+                    profile_reqs[endpoint] = reqs
+                    profile_dropped[endpoint] = {i for i in reqs if not is_path_member(i, 1)}
+                    logging.info("P%d custom endpoint %r: %d requirements, %d not nameable (%s)",
+                                 player, endpoint.name, len(reqs), len(profile_dropped[endpoint]),
                                  sorted(i.name for i in profile_dropped[endpoint]))
 
             # Each endpoint has its own path
@@ -844,34 +986,76 @@ class ArchiLogicWorld(World):
                 if not endpoint.is_event:
                     go_mode_items.setdefault(player, set()).add(endpoint)
 
-                paths[player][endpoint] = set()
+                paths[player][endpoint] = {}
                 path = paths[player][endpoint]
 
-                endpoint_reqs = (profile_reqs[endpoint] if isinstance(endpoint, CustomEndpoint)
-                                 else hintable_loc_reqs[endpoint.location])
+                # Strongest arrival first. Certainty is a bottleneck cost — a child is
+                # max(parent, edge), so it never decreases along an edge — which makes
+                # best-first order-independent. A plain stack made the result depend on pop
+                # order, and pop order varies per process because Item hashing is seeded.
+                visited: Set[Location] = set()
+                frontier: List[Tuple[int, int, str, int, Location, Certainty]] = []
+                arrival_sequence = itertools.count()
 
-                req_stack = list(endpoint_reqs)
-                while req_stack:
-                    item = req_stack.pop()
-                    if item in path:
+                def reach(location, certainty) -> None:
+                    heapq.heappush(frontier, (-CERTAINTY_RANK[certainty], location.player,
+                                              location.name, next(arrival_sequence),
+                                              location, certainty))
+
+                def walk_requirements(requirements, source, arrival) -> None:
+                    """Record each requirement as a path member, then queue the locations holding
+                    the copies this route needs."""
+                    necessary_here = (set(requirements) if source is None
+                                      else resolved_loc_necessary.get(source, set()))
+
+                    for item, count in requirements.items():
+                        if cls.filter_other_endpoints and item in player_endpoints[player]:
+                            continue
+
+                        # An item keeps the arrival's strength only if it's necessary at the
+                        # location that pulled it in. Otherwise this route merely chose it.
+                        certainty = arrival
+                        if certainty is Certainty.Necessary and item not in necessary_here:
+                            certainty = Certainty.Route
+
+                        if is_path_member(item, count):
+                            member = path.get(item)
+                            if member is None:
+                                path[item] = PathMember(item, count, certainty)
+                                if is_hintable(item):
+                                    items_to_paths.setdefault(item, set()).add(endpoint)
+                            else:
+                                member.count = max(member.count, count)
+                                if CERTAINTY_RANK[certainty] > CERTAINTY_RANK[member.certainty]:
+                                    member.certainty = certainty
+
+                        # Expansion is gated, not filtered. Walking every copy of a bulk item
+                        # collapses every path to the whole required pool — measured at 146 of
+                        # 157 items, identical for all 13 endpoints in the test seed. Walking the
+                        # cheapest `count` copies instead stays bounded (+3 to +27 items) and
+                        # keeps the subtree behind the gate, which is where the cross-world
+                        # structure lives.
+                        total = graph_copies[item]
+                        child_certainty = (Certainty.BulkCluster if 1 < total and count < total
+                                           else certainty)
+                        for holder in cheapest_holders(item, count):
+                            reach(holder, child_certainty)
+
+                if isinstance(endpoint, CustomEndpoint):
+                    # Profile endpoints name items directly rather than sitting at a location.
+                    walk_requirements(Counter(dict.fromkeys(profile_reqs[endpoint], 1)),
+                                      None, Certainty.Necessary)
+                else:
+                    walk_requirements(location_req_counts.get(endpoint.location, Counter()),
+                                      endpoint.location, Certainty.Necessary)
+
+                while frontier:
+                    *_, location, arrival = heapq.heappop(frontier)
+                    if location in visited:
                         continue
-                    if cls.filter_other_endpoints and item in player_endpoints[player]:
-                        continue
-
-                    # Item is on the path
-                    path.add(item)
-                    if not items_to_paths.get(item):
-                        items_to_paths[item] = set()
-                    items_to_paths[item].add(endpoint)
-                    # Which means it's also required for go-mode
-                    if not go_mode_items.get(player):
-                        go_mode_items[player] = set()
-                    go_mode_items[player].add(item)
-
-                    # If it has further requirements, those should be on the path too
-                    if not item.location is None:
-                        req_stack.extend(hintable_loc_reqs[item.location])
-
+                    visited.add(location)
+                    walk_requirements(location_req_counts.get(location, Counter()),
+                                      location, arrival)
                 # Nothing gates this endpoint — it's precollected or available from the start.
                 # There's no path to hint about, so drop it; it stays in player_endpoints and
                 # go_mode_items for hint types that don't need a path.
@@ -880,75 +1064,19 @@ class ArchiLogicWorld(World):
 
         t6 = time.perf_counter()
 
-        # We need item_requirements to build our backing logic for the /hint_towards command.
-        if cls.build_item_requirements:
-            requirements_start = time.perf_counter()
-
-            def copies_required(target_location, loc_requirements, available_items) -> Counter:
-                """
-                How many copies of each requirement the target location actually needs.
-                This scan accounts for items with multiple copies (think Progressive Strength from OOT)
-                We do this by binary searching on the total amount of copies to determine exactly how many copies
-                a specific location requires. This is also needed to determine when multiple copies of an item
-                create an either/or situation, where multiple copies are equally valid options for progression.
-                """
-                available_copies = Counter(available_items)
-                required_copies = Counter()
-
-                for req in loc_requirements:
-                    total_copies = available_copies[req]
-                    if total_copies <= 1:
-                        required_copies[req] = 1
-                        continue
-
-                    state_without_reqs = baseline.copy()
-                    for item in available_items:
-                        if item != req:
-                            state_without_reqs.collect(item, True)
-
-                    fewest, most = 1, total_copies
-                    while fewest < most:
-                        trial_count = (fewest + most) // 2
-                        probe_state = state_without_reqs.copy()
-                        for _ in range(trial_count):
-                            probe_state.collect(req, True)
-                        if target_location.can_reach(probe_state):
-                            most = trial_count
-                        else:
-                            fewest = trial_count + 1
-                    required_copies[req] = fewest
-
-                return required_copies
-
-            all_available_items = [loc.item for loc in global_req_locs]
-            all_available_items += [item for items in multiworld.precollected_items.values()
-                                    for item in items if item.advancement]
-
-            # Keyed by location, not by item. Sphere ordering guarantees a location only requires
-            # items from earlier spheres, which makes the graph acyclic — but that holds per
-            # location, not per item type. Collapsing copies lets a deep copy's requirements stand
-            # in for a shallow one, which closes cycles: Sublime Bone Dust -> King's Ring ->
-            # Strength Upgrade -> Lens of Truth -> Sublime Bone Dust.
-            location_req_counts: Dict[Location, Counter] = {}
-            location_contents: Dict[Location, Item] = {}
-
-            for location in global_req_locs:
-                if location.item is None:
-                    continue
-                location_contents[location] = location.item
-                location_req_counts[location] = copies_required(location,
-                                                                resolved_loc_reqs.get(location, set()),
-                                                                all_available_items)
-
-            # Precollected items have no location, so they're the client's starting state rather
-            # than nodes in the graph.
-            starting_items: Dict[int, Counter] = {
-                player: Counter(item.name for item in items if item.advancement)
-                for player, items in multiworld.precollected_items.items()
-            }
-
-            logging.info("Built location requirements in %.2fs: %d locations",
-                         time.perf_counter() - requirements_start, len(location_req_counts))
+        # Why multi-copy requirements never made it onto a path. Also prints each copy's
+        # classification: Item collapses on (name, player), so the instance a requirement set
+        # holds is an arbitrary copy — and if copies disagree on classification, that's the
+        # same arbitrary-copy hazard as item.location, just a different attribute.
+        for key, reasons in sorted(refusals.items()):
+            if key in admitted or item_counts[key] <= 1:
+                continue
+            copies = [loc.item for loc in multiworld.get_filled_locations()
+                      if (loc.item.name, loc.item.player) == key]
+            logging.info("P%d %s never admitted (%d copies, classifications %s): %s",
+                         key[1], key[0], item_counts[key],
+                         sorted({c.classification.name for c in copies}),
+                         "; ".join(sorted(reasons)))
 
         # Endpoints with no meaningful path: either nothing gates them at all, or the only
         # things that do are items we deliberately suppress. Either way the player isn't
@@ -964,9 +1092,9 @@ class ArchiLogicWorld(World):
                         continue
                     if ep.location is None:
                         continue
-                    raw = necessary_reqs.get(ep.location, set())
-                    pathless_endpoints[player][ep] = raw - hintable_loc_reqs.get(ep.location, set())
-
+                    gates = location_req_counts.get(ep.location, Counter())
+                    pathless_endpoints[player][ep] = {item for item, count in gates.items()
+                                                      if not is_path_member(item, count)}
         if cls.dump_profile_reference:
             reference = {}
             for player in all_players:
@@ -1025,13 +1153,15 @@ class ArchiLogicWorld(World):
                     "paths": {
                         endpoint.name: [
                             {
-                                "name": i.name,
-                                "player": i.player,
-                                "is_event": i.is_event,
-                                "location": i.location.name if i.location else None,
-                                "location_player": i.location.player if i.location else None,
+                                "name": member.item.name,
+                                "player": member.item.player,
+                                "is_event": member.item.is_event,
+                                "count": member.count,
+                                "certainty": member.certainty,
+                                "location": member.item.location.name if member.item.location else None,
+                                "location_player": member.item.location.player if member.item.location else None,
                             }
-                            for i in sorted(path, key=lambda x: (x.player, x.name))
+                            for member in sorted(path.values(), key=lambda m: (m.item.player, m.item.name))
                         ]
                         for endpoint, path in sorted(endpoints.items(), key=lambda kv: kv[0].name)
                     },
@@ -1088,8 +1218,15 @@ class ArchiLogicWorld(World):
                 logging.debug("Hint creation disabled. For some reason.")
                 break
 
+            # Determine how directly we hint the location/item. Can be overridden by profiles.
+            if item.location is None:
+                hint_directness = Directness.Item
+            elif profile_for(multiworld.game[item.location.player]).prefer_loc_over_region:
+                hint_directness = Directness.Location
+            else:
+                hint_directness = Directness.Region
+
             hint_set = HintSet()
-            hint_directness = Directness.Location if item.location else Directness.Item
             path_players = set()
             endpoints_dict: Dict[Tuple[int, str], Set[Item]] = defaultdict(set)
 
@@ -1128,18 +1265,16 @@ class ArchiLogicWorld(World):
                 hint_set.generic_woth = WothHint(
                     item,
                     hint_directness,
-                    set(),
-                    set(),
+                    {},
                     False
                 )
 
             if cls.create_specific_woths:
                 hint_set.specific_woth = WothHint(
                     item,
-                    hint_directness,
-                    path_players,
-                    set(multiworld.player_name[player] for player in path_players),
-                    path_players == all_players,
+                    Directness.Location if hint_directness == Directness.Region else hint_directness,
+                    {slot_id: multiworld.player_name[slot_id] for slot_id in path_players},
+                    len(path_players) == len(all_players),
                 )
 
             hint_sets[item] = hint_set
@@ -1162,30 +1297,81 @@ class ArchiLogicWorld(World):
             multipath_num = math.ceil(len(selected_items) * 2 / 3)
             woth_num = len(selected_items) - multipath_num
 
+            player_hints = []
             for item in selected_items:
                 hint_set = hint_sets[item]
                 if multipath_num > 0 and hint_set.multi_path:
-                    selected_hints.append(hint_set.multi_path)
+                    player_hints.append(hint_set.multi_path)
                     multipath_num -= 1
                 elif woth_num > 0 and hint_set.specific_woth:
-                    selected_hints.append(hint_set.specific_woth)
+                    player_hints.append(hint_set.specific_woth)
                     woth_num -= 1
+
+            # Do a seeded random shuffle so the hints aren't ordered by type
+            archilogic_world.random.shuffle(player_hints)
+            selected_hints.extend(player_hints)
+
+        for index, hint in enumerate(selected_hints):
+            hint.id = index
+
         archilogic_world.selected_hints = selected_hints
+        # Only locations the server knows about — event locations have no address and
+        # never arrive as checks, so counting them would inflate the denominator the
+        # grant and hint_toward percentages are measured against.
+        archilogic_world.location_counts = {
+            str(player): sum(1 for loc in multiworld.get_locations(player)
+                             if isinstance(loc.address, int))
+            for player in all_players
+        }
 
         if cls.build_item_requirements:
+            # Display names are the only names the client ever sees, so two distinct
+            # items resolving to the same one would merge into a single graph node and
+            # let a requirement for one be satisfied by the other. Check the shipped
+            # set, not the profile's dict — get_display_name also falls through to the
+            # apworld's hint_text, which no profile author sees.
+            shipped: Dict[Tuple[int, str], Set[str]] = defaultdict(set)
+            for item in all_available_items:
+                shipped[(item.player, get_display_name(item))].add(item.name)
+            for (player, shown), raw_names in sorted(shipped.items()):
+                if len(raw_names) > 1:
+                    raise ArchiLogicError(
+                        f"P{player}: display name {shown!r} maps to several distinct items: "
+                        f"{sorted(raw_names)}. Display names must be unique per player.")
+
             archilogic_world.location_graph = [
                 {
                     "name": location.name,
                     "world": location.player,
-                    "address": location.address,          # None for events — not a real check
-                    "item": [location_contents[location].name, location_contents[location].player],
-                    "requires": [[requirement.name, requirement.player, count]
+                    "sphere": location_sphere_depth[location],
+                    "address": location.address if isinstance(location.address, int) else None,
+                    "item": [get_display_name(location_contents[location]),
+                             location_contents[location].player],
+                    "requires": [[get_display_name(requirement), requirement.player, count]
                                  for requirement, count in sorted(
                                      requirements.items(), key=lambda kv: (kv[0].player, kv[0].name))],
                 }
                 for location, requirements in sorted(location_req_counts.items(),
                                                      key=lambda kv: (kv[0].player, kv[0].name))
             ]
+
+            # CustomEndpoints are synthetic — no location, so nothing in the loop above
+            # emits them. Without a node, /hint_toward can't walk to one even though
+            # hints name it. address=None marks it unobservable, which is correct: the
+            # client collects it once its requirements are met, same as an event.
+            archilogic_world.location_graph.extend(
+                {
+                    "name": endpoint.name,
+                    "world": endpoint.player,
+                    "sphere": len(collection_spheres),
+                    "address": None,
+                    "item": [endpoint.name, endpoint.player],
+                    "requires": [[get_display_name(req), req.player, 1]
+                                 for req in sorted(reqs, key=lambda i: (i.player, i.name))],
+                }
+                for endpoint, reqs in sorted(profile_reqs.items(), key=lambda kv: (kv[0].player, kv[0].name))
+            )
+
             archilogic_world.starting_items = {str(player): dict(items)
                                                for player, items in starting_items.items()}
 
