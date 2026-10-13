@@ -3,6 +3,8 @@ from ._profile import GameProfile, CustomEndpoint
 class DonkeyKong64(GameProfile):
     game = "Donkey Kong 64"
 
+    prefer_loc_over_region = True
+
     bulk_items = {"Golden Banana", "Banana Medal", "Banana Fairy", "Battle Crown"}
 
     display_names = {

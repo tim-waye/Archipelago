@@ -43,6 +43,10 @@ class GameProfile:
     # generating player-facing text. The only accepted keys will be "item", "location", and "region"
     prefer_hint_text: Dict[str, bool] = {}
 
+    # Some apworlds don't have the most useful region names. Setting this to true will make sure hints
+    # referring this game will always use the location name instead of the region name.
+    prefer_loc_over_region: bool = False
+
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
         if cls.game:
@@ -78,6 +82,13 @@ class GameProfile:
         if missing := wanted_items - {item.name for item in found_items}:
             logging.warning("%s profile: unknown item names %s", self.game, sorted(missing))
         return found_items
+
+    def item_is_excluded(self, multiworld: MultiWorld, item_name: str) -> bool:
+        """"
+        # Override if you have any items that shouldn't be considered for path hints
+        # For example, hinting small keys in A Link to the Past would just spam paths with a lot of similar requirements.
+        """
+        return False
 
 
 DEFAULT = GameProfile()
