@@ -29,6 +29,8 @@ class HintType(StrEnum):
     SpecificWoth = "specific_woth"
     SinglePath = "single_path"
     MultiPath = "multi_path"
+    Density = "density"
+
 
 class Certainty(StrEnum):
     """How strong a claim a path membership supports."""
@@ -65,6 +67,10 @@ class Hint:
         self.location_id = int_id(hint_item.location.address) if hint_item.location else None
         self.location_player = hint_item.location.player if hint_item.location else None
         self.finder_id = hint_item.player if hint_item.location is None else hint_item.location.player
+        # Which player's hint budget minted this. Same as finder_id until the selection
+        # loop says otherwise — a path belongs to the game whose endpoint it serves, and
+        # that game's items mostly sit in other people's worlds.
+        self.for_player = self.finder_id
         # First half of hint text.
         self.subject_parts, self.directness = write_item_hint_text(hint_item, directness)
         self.parts: list[dict] = []
@@ -84,6 +90,7 @@ class Hint:
             "location_player": self.location_player,
             "directness": self.directness.value,
             "finder_id": self.finder_id,
+            "for_player": self.for_player,
         }
 
 class WothHint(Hint):
@@ -188,6 +195,33 @@ class MultiPathHint(Hint):
             for _, ends in sorted(self.endpoints.items())
             for e in sorted(ends, key=get_display_name)
         ]
+        return slot_data
+
+class DensityHint(Hint):
+    def __init__(self, collectible: Item, area_slot: int, area: Region | None, area_name: str, held: int):
+        super().__init__(collectible, Directness.Item)
+        self.location_id = None
+        self.location_player = None
+        # No single placement to point at, so the area's owner is who'd find these.
+        self.finder_id = area_slot
+        self.held = held
+
+        self.hint_type = HintType.Density
+        name = get_display_name(collectible)
+        where = ([span("region", area_name, area_slot)] if area is not None
+                 else [span("player", area_name, area_slot), span("text", "'s world")])
+        if held:
+            self.parts = ([span("text", f"{held} "), span("item", f"{name}{'' if held == 1 else 's'}", collectible.player),
+                           span("text", f" {'is' if held == 1 else 'are'} in ")]
+                          + where + [span("text", ".")])
+        else:
+            self.parts = ([span("text", "There are no "), span("item", f"{name}{'' if held == 1 else 's'}", collectible.player),
+                           span("text", " in ")] + where + [span("text", ".")])
+
+    def to_slot_data(self) -> dict:
+        slot_data = super().to_slot_data()
+        slot_data["hint_type"] = self.hint_type.value
+        slot_data["held"] = self.held
         return slot_data
 
 def write_item_hint_text(item, directness) -> Tuple[list[dict], Directness]:

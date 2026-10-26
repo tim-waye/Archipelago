@@ -13,17 +13,18 @@ import math
 from BaseClasses import CollectionState, Location, Item, ItemClassification, DEFAULT_COLLECTION_RULE, Region
 from NetUtils import convert_to_base_types
 from Options import OptionError
+from Utils import user_path
 from worlds.AutoWorld import World
 from worlds.archilogic.HintClasses import (MultiPathHint, Directness, SinglePathHint, WothHint, Hint,
-                                           set_player_profiles, Certainty, CERTAINTY_RANK, PathMember, get_display_name)
+                                           set_player_profiles, Certainty, CERTAINTY_RANK, PathMember, get_display_name,
+                                           DensityHint, span, flatten_item)
 from worlds.archilogic.errors import ArchiLogicError
 from worlds.archilogic.games import GameProfile, profile_for, CustomEndpoint
 
-
 class ArchiLogicWorld(World):
     game = "ArchiLogic"
-    item_name_to_id: Dict[str, int] = {}
-    location_name_to_id: Dict[str, int] = {}
+    item_name_to_id: Dict[str, int] = {"Hello World!": 1}
+    location_name_to_id: Dict[str, int] = {"ArchiLogic Location": 1}
 
     @classmethod
     def stage_assert_generate(cls, multiworld) -> None:
@@ -36,8 +37,11 @@ class ArchiLogicWorld(World):
     bulk_item_threshold = 6
     locks_too_much_threshold = 50
 
-    # Debug artifacts written into the per-run analysis directory.
-    dump_paths = True                # endpoint paths — the main tuning artifact
+    # Debug artifacts, written under the user's Archipelago folder. All off unless
+    # ARCHILOGIC_DEBUG is set: loaded from an .apworld, __file__ points inside the zip,
+    # and os.makedirs can't create a directory in there.
+    debug_artifacts = bool(os.environ.get("ARCHILOGIC_DEBUG"))
+    dump_paths = debug_artifacts     # endpoint paths — the main tuning artifact
     dump_profile_reference = False   # names, groups and events, for writing a GameProfile
 
     # Making the paths feel good and useful is going to be a bit of a tuning exercise. I've made a few features to
@@ -76,6 +80,12 @@ class ArchiLogicWorld(World):
     # handling done here, but for now I'm just going to sidestep the issue until a later update.
     filter_multi_copy_items = True
 
+    # Bulk items are excluded from being hint subjects on the same either/or grounds, just at a
+    # larger scale. Turning this off treats them exactly like any other multi-copy item: the route's
+    # cheapest copies get named instead of the item. bulk_item_threshold keeps a job either way —
+    # above it, only the single earliest copy is named rather than every copy the route needs.
+    filter_bulk_items = False
+
     # If any items are forced early either within one game or the whole multiworld, exclude them from the paths
     # These items are most likely forced early because they lock a large proportion of some game's locations. If one
     # item locks most of the checks in a world, then it'll will practically always be required, probably will be on
@@ -85,13 +95,13 @@ class ArchiLogicWorld(World):
     # If we path hinted it, it'd be like saying "some items on all these paths are somewhere in the ~95% of DS3 that is
     # behind the Small Lothric Banner."
     # Which is not very helpful to anyone, we're better off just hinting by world at that point.
-    filter_forced_early = True
+    filter_forced_early = False
 
     # If any one item locks too much of its own game, then leave it off of paths. This is configurable by setting the
     # locks_too_much_threshold value. Anything locking more than that percentage of checks will be considered too much.
     # The reasoning for this is the same as filter_forced_early, widely required items are likely to be found early,
     # and don't provide much useful information for path hints.
-    filter_locks_too_much = True
+    filter_locks_too_much = False
 
     # Flags for Hint creation
     create_generic_woths = False
@@ -106,13 +116,37 @@ class ArchiLogicWorld(World):
     # is launched, not at generation, so ArchiLogic paces against each player's own
     # location count instead: one hint per grant_percent of their checks.
     hints_per_player = 20
+
+    # A collectible endpoint ("collect 33 of 37 pieces") needs most of the multiworld to reach,
+    # so its path dwarfs every other path that game has — 30 members against 13 and 15 in the
+    # test seed. Round-robin alone would still hand it an equal share every pass, so it takes
+    # its turns like any other path up to this many, then sits out and the real paths get the
+    # remainder. Density hints are meant to cover what this leaves out.
+    collectible_path_hints = 3
+
+    # How often a drawn placement becomes a multi-path hint rather than a WOTH. A collectible
+    # endpoint gets none: its density hints already say where the copies are, so the remaining
+    # draws are better spent on WOTHs naming a specific copy or the item locking the room it
+    # sits in. For a single-endpoint game the multipath is near-redundant anyway — "on the Path
+    # to Victory for Jigsaw" and "on the Path to 33x 1 Puzzle Piece" name the same thing.
+    multi_path_share = 2 / 3
+    collectible_multi_path_share = 0
+
+    # Density hints — where a collectible's copies sit. Counts are absolute, never "N of M":
+    # how many copies exist in the seed isn't something a player can see, so measuring against
+    # it would be a claim they can't check. What they can see is the endpoint's own name, which
+    # states how many they need — so that's what a count gets judged against.
+    density_share = 0.5                # of an endpoint's hints, at most this many are density
+
+
     grant_percent = 3
-    toward_percent = 5
+    target_hints_percent = 5
     location_counts: Dict[str, int] = {}
 
     selected_hints: List[Hint] = []
     location_graph: List[dict] = []
     starting_items: Dict[str, Dict[str, int]] = {}
+    endpoints: List[dict] = []
 
     def fill_slot_data(self) -> Dict[str, Any]:
         return {
@@ -121,9 +155,10 @@ class ArchiLogicWorld(World):
             "starting_items": self.starting_items,
             "bulk_item_threshold": self.bulk_item_threshold,
             "location_counts": self.location_counts,
+            "endpoints": self.endpoints,
             "hint_economy": {
                 "grant_percent": self.grant_percent,
-                "toward_percent": self.toward_percent,
+                "target_hints_percent": self.target_hints_percent,
             },
         }
 
@@ -139,15 +174,17 @@ class ArchiLogicWorld(World):
         logging.info("ArchiLogic profiles loaded: %s", sorted(GameProfile.PROFILES))
 
 
-        # Setup debug logging and json dumping
-        here: str = os.path.dirname(__file__)
-        run_dir = os.path.join(here, "analysis",
-                               f"{time.strftime('%Y%m%d-%H%M%S')}-seed{getattr(multiworld, 'seed', 'x')}")
-        os.makedirs(run_dir, exist_ok=True)
+        # user_path uses the install directory when it's writable and the user's home
+        # Archipelago folder when it isn't, so this works from source and from an apworld.
+        run_dir = None
+        if cls.debug_artifacts:
+            run_dir = user_path("archilogic",
+                                f"{time.strftime('%Y%m%d-%H%M%S')}-seed{getattr(multiworld, 'seed', 'x')}")
+            os.makedirs(run_dir, exist_ok=True)
 
-        run_log = logging.FileHandler(os.path.join(run_dir, "archilogic.log"), encoding="utf-8")
-        run_log.setFormatter(logging.Formatter("%(levelname)s  %(message)s"))
-        logging.getLogger().addHandler(run_log)
+            run_log = logging.FileHandler(os.path.join(run_dir, "archilogic.log"), encoding="utf-8")
+            run_log.setFormatter(logging.Formatter("%(levelname)s  %(message)s"))
+            logging.getLogger().addHandler(run_log)
 
         # Step One: In order to calculate the critical paths for the multiworld and/or each player, we essentially need our
         # own version of the playthrough from the spoiler log. So we're going to copy how the Spoiler class does that.
@@ -647,9 +684,10 @@ class ArchiLogicWorld(World):
         refusals: Dict[Tuple[str, int], Set[str]] = defaultdict(set)
         admitted: Set[Tuple[str, int]] = set()
 
-        def is_path_member(item, count) -> bool:
+        def is_path_member(item, count, exempt: bool = False) -> bool:
             """Structurally a dependency of this route. Traversal is separate again — bulk gates
-            are walked through without being members."""
+            are walked through without being members. `exempt` waives the N-of-M refusal for a
+            collectible on its own endpoint, where the count is already stated in the name."""
             def refuse(reason):
                 refusals[(item.name, item.player)].add(reason)
                 return False
@@ -660,7 +698,7 @@ class ArchiLogicWorld(World):
                 return refuse(f"classification {canon.classification.name}")
             if canon.location is None:
                 return refuse("precollected")
-            if cls.filter_multi_copy_items and 1 < total and count < total:
+            if cls.filter_multi_copy_items and not exempt and 1 < total and count < total:
                 return refuse(f"N of M (needs {count} of {total})")
             return True
 
@@ -682,7 +720,7 @@ class ArchiLogicWorld(World):
                 return refuse("forced_early")
             if profile_for(canon.game).item_is_excluded(multiworld, canon.name):
                 return refuse("profile_excluded")
-            if total > cls.bulk_item_threshold:
+            if cls.filter_bulk_items and total > cls.bulk_item_threshold:
                 return refuse(f"bulk ({total} copies > {cls.bulk_item_threshold})")
             if locks_too_much(canon):
                 return refuse("locks_too_much")
@@ -769,6 +807,7 @@ class ArchiLogicWorld(World):
             _t0 = time.perf_counter()
             deep_state_cache = {}
             shallow_state_cache = {}
+            goal_copies: Dict[Item, int] = {}
             for item in items_by_name(player).values():
                 key = (item.name if item.name in final_state.prog_items[player]
                        else stored_name(player, item))
@@ -785,6 +824,20 @@ class ArchiLogicWorld(World):
                     continue
 
                 deep_state_cache[item] = state_minus_item
+
+                # How many copies the goal actually needs. Same binary search as
+                # copies_required, probing the completion condition instead of a location.
+                fewest, most = 1, count
+                while fewest < most:
+                    trial = (fewest + most) // 2
+                    probe = state_minus_item.copy()
+                    for _ in range(trial):
+                        probe.collect(item, True)
+                    if multiworld.completion_condition[player](probe):
+                        most = trial
+                    else:
+                        fewest = trial + 1
+                goal_copies[item] = fewest
                 shallow = final_state.copy()
                 shallow_backup = (shallow.reachable_regions[item.player],
                                     shallow.blocked_connections[item.player],
@@ -863,6 +916,26 @@ class ArchiLogicWorld(World):
             if not found_endpoints or found_endpoints == reqs_for_goal:
                 found_endpoints = set(reqs_for_goal)
 
+            def collectible_endpoint(collectible, needed) -> CustomEndpoint:
+                """A counted gate is an endpoint in its own right. Shared by both shapes: a goal
+                that counts for itself, and a goal sitting behind a counted location rule."""
+                synthetic = CustomEndpoint(
+                    name=f"{needed}x {get_display_name(collectible)}", player=player,
+                    items=(collectible.name,))  # only satisfies __post_init__; never read
+                profile_reqs[synthetic] = Counter({collectible: needed})
+                collectible_of[synthetic] = collectible
+                logging.info("P%d collectible goal: %s needs %d of %d copies", player,
+                             collectible.name, needed,
+                             item_counts[(collectible.name, collectible.player)])
+                return synthetic
+
+            # Any item the goal needs several copies of is a collectible: "collect 7 Leeks" is
+            # itself the endpoint, and the copies are scattered — often into other players'
+            # worlds — so there is no single location to drill into.
+            for item in {i for i in found_endpoints if goal_copies.get(i, 1) > 1}:
+                found_endpoints.discard(item)
+                found_endpoints.add(collectible_endpoint(item, goal_copies[item]))
+
             # 4. One last edge case.
             # If a game only has one single endpoint then paths are no different from standard WOTH hints.
             # In this case we'll drill down until we find multiple requirements that unlock the goal condition.
@@ -876,15 +949,30 @@ class ArchiLogicWorld(World):
                 seen_endpoint_items = set()
                 while len(found_endpoints) == 1:
                     item = next(iter(found_endpoints))
-                    if item in seen_endpoint_items or item.location is None:
+                    if (isinstance(item, CustomEndpoint) or item in seen_endpoint_items
+                            or item.location is None):
                         break
                     seen_endpoint_items.add(item)
                     deeper = set()
+                    gates = location_req_counts.get(item.location, Counter())
                     for req in location_necessary.get(item.location, ()):
+                        # Nothing anyone can find, so never a useful endpoint. The path walk
+                        # already refuses these; the drill-down used to let them through, and
+                        # could swap a real endpoint for a start-inventory item.
+                        if not req.is_event and req.location is None:
+                            continue
+
+                        # How many this route needs, not how many exist in the seed. The two
+                        # disagree exactly where it matters: Jigsaw needs 37 of 37 pieces,
+                        # which the seed-copy count reads as unnameable bulk.
+                        needed = gates.get(req, 1)
+                        if needed > 1:
+                            deeper.add(collectible_endpoint(req, needed))
+                            continue
+
                         copies = item_counts[(req.name, req.player)]
                         if (req.is_event
-                                or (is_hintable(req, record=False)
-                                    and not (cls.filter_multi_copy_items and copies > 1))):
+                                or (is_hintable(req, record=False) and copies <= 1)):
                             deeper.add(req)
                     deeper.discard(item)
                     if not deeper:
@@ -898,6 +986,19 @@ class ArchiLogicWorld(World):
                              sorted(e.name for e in found_endpoints), sorted(e.name for e in adjusted))
                 found_endpoints = adjusted
 
+            # Every endpoint has to be something someone can actually find. A precollected item
+            # has no location, so there is nothing to path to and the endpoint quietly vanishes
+            # at filter_empty_paths — with nothing in _pathless_endpoints either, since that
+            # skips location-less entries as well.
+            unfindable = {e for e in found_endpoints
+                          if not isinstance(e, CustomEndpoint) and e.location is None}
+            if unfindable:
+                logging.warning("P%d dropping unfindable endpoints: %s",
+                                player, sorted(i.name for i in unfindable))
+                found_endpoints -= unfindable
+            if not found_endpoints:
+                logging.warning("P%d has no endpoints — this player gets no path hints.", player)
+
             logging.info("P%d endpoints:       %s", player, sorted(i.name for i in found_endpoints))
             return found_endpoints
 
@@ -906,9 +1007,9 @@ class ArchiLogicWorld(World):
         go_mode_items: Dict[int, Set[Item]] = {}
         paths: Dict[int, Dict[Item, PathMember]] = {}
 
-        # Keep track of which paths each item is on. This will be used to give path/multi-path hints.
-        # The hints will be structured in some form of: "This item is on the path to these endpoints"
-        items_to_paths = {}
+        # Which paths each placement is on. Keyed by location rather than item: copies of one item
+        # sit in different worlds, so the copy we name decides both the hint text and the finder.
+        items_to_paths: Dict[Location, Set[Item]] = {}
 
         # Keep track of any endpoints that don't end up with useful paths to hint
         pathless_endpoints: Dict[int, Dict[Item, Set[Item]]] = defaultdict(dict)
@@ -918,7 +1019,14 @@ class ArchiLogicWorld(World):
         all_candidates += [i for i in multiworld.precollected_items[player] if i.advancement]
 
         # CustomEndpoints might have their own rules and need some special case handling.
-        profile_reqs: Dict[CustomEndpoint, Set[Item]] = {}
+        # Counter rather than Set: a collectible endpoint needs N copies of one item, and Item
+        # collapses on (name, player), so a set flattens "7 Leeks" down to "a Leek".
+        profile_reqs: Dict[CustomEndpoint, Counter] = {}
+
+        # Which collectible each synthesised endpoint counts. A placement of that collectible
+        # can't carry a path hint to its own endpoint ("a Leek is on the Path to 5x Leek"), but
+        # it is exactly what a WOTH hint wants to name.
+        collectible_of: Dict[CustomEndpoint, Item] = {}
 
         for player in all_players:
             paths[player] = {}
@@ -934,10 +1042,16 @@ class ArchiLogicWorld(World):
                     all_required_held.collect(item, True)
 
                 for endpoint in custom_endpoints:
+                    # Synthesised collectible endpoints already carry their requirements.
+                    if endpoint in profile_reqs:
+                        continue
+
                     # Case 1: CustomEndpoints can have a direct set of required items
                     wanted_items = set(endpoint.items)
-                    reqs: Set[Item] = {loc.item for loc in multiworld.get_filled_locations()
-                                       if loc.item.player == player and loc.item.name in wanted_items}
+                    reqs: Counter = Counter({loc.item: 1 for loc in multiworld.get_filled_locations()
+                                             if loc.item.player == player
+                                             and loc.item.name in wanted_items})
+
                     if missing := wanted_items - {item.name for item in reqs}:
                         logging.warning("P%d custom endpoint %r names unknown items: %s",
                                         player, endpoint.name, sorted(missing))
@@ -951,7 +1065,7 @@ class ArchiLogicWorld(World):
                             logging.info("P%d custom endpoint %r names %r, which is unknown or outside "
                                          "the required set.", player, endpoint.name, loc_name)
                             continue
-                        reqs |= set(location_req_counts.get(location, Counter()))
+                        reqs |= location_req_counts.get(location, Counter())
 
                     # Case 3: CustomEndpoints can have a custom rule.
                     # This would be a function that takes a CollectionState and returns a bool.
@@ -966,10 +1080,10 @@ class ArchiLogicWorld(World):
                             player_endpoints[player].discard(endpoint)
                             dropped_endpoint = True
                             break
-                        _, necessary = get_access_reqs(rule, required_items, endpoint.name)
+                        necessary, _ = get_access_reqs(rule, required_items, endpoint.name)
                         if cls.filter_events:
                             necessary = resolve_event_reqs(necessary, location_necessary, necessary_cache)
-                        reqs |= necessary
+                        reqs |= Counter(dict.fromkeys(necessary, 1))
                     if dropped_endpoint:
                         continue
 
@@ -1018,33 +1132,47 @@ class ArchiLogicWorld(World):
                         if certainty is Certainty.Necessary and item not in necessary_here:
                             certainty = Certainty.Route
 
-                        if is_path_member(item, count):
-                            member = path.get(item)
-                            if member is None:
-                                path[item] = PathMember(item, count, certainty)
-                                if is_hintable(item):
-                                    items_to_paths.setdefault(item, set()).add(endpoint)
-                            else:
-                                member.count = max(member.count, count)
-                                if CERTAINTY_RANK[certainty] > CERTAINTY_RANK[member.certainty]:
-                                    member.certainty = certainty
+                        # A partial gate is an either/or: the route needs *a* copy, not the one we
+                        # name, so the membership can't carry a stronger claim than the cluster.
+                        # Measured against every copy in the seed, not just the ones the pruned
+                        # playthrough uses — a player can satisfy the gate from any of them.
+                        total = item_counts[(item.name, item.player)]
+                        if 1 < total and count < total:
+                            certainty = Certainty.BulkCluster
 
                         # Expansion is gated, not filtered. Walking every copy of a bulk item
                         # collapses every path to the whole required pool — measured at 146 of
                         # 157 items, identical for all 13 endpoints in the test seed. Walking the
                         # cheapest `count` copies instead stays bounded (+3 to +27 items) and
                         # keeps the subtree behind the gate, which is where the cross-world
-                        # structure lives.
-                        total = graph_copies[item]
-                        child_certainty = (Certainty.BulkCluster if 1 < total and count < total
-                                           else certainty)
-                        for holder in cheapest_holders(item, count):
-                            reach(holder, child_certainty)
+                        # structure lives. These are also the copies worth hinting: earliest
+                        # reachable first, the same order the playthrough collects them in.
+                        holders = cheapest_holders(item, count)
+
+                        if is_path_member(item, count,
+                                          exempt=item == collectible_of.get(endpoint)):
+                            member = path.get(item)
+                            if member is None:
+                                path[item] = PathMember(item, count, certainty)
+                            else:
+                                member.count = max(member.count, count)
+                                if CERTAINTY_RANK[certainty] > CERTAINTY_RANK[member.certainty]:
+                                    member.certainty = certainty
+
+                            # Registered per holder, outside the first-arrival branch: a later
+                            # arrival needing more copies brings more holders with it.
+                            if is_hintable(item):
+                                named = (holders if total <= cls.bulk_item_threshold
+                                         else holders[:1])
+                                for holder in named:
+                                    items_to_paths.setdefault(holder, set()).add(endpoint)
+
+                        for holder in holders:
+                            reach(holder, certainty)
 
                 if isinstance(endpoint, CustomEndpoint):
                     # Profile endpoints name items directly rather than sitting at a location.
-                    walk_requirements(Counter(dict.fromkeys(profile_reqs[endpoint], 1)),
-                                      None, Certainty.Necessary)
+                    walk_requirements(profile_reqs[endpoint], None, Certainty.Necessary)
                 else:
                     walk_requirements(location_req_counts.get(endpoint.location, Counter()),
                                       endpoint.location, Certainty.Necessary)
@@ -1095,7 +1223,7 @@ class ArchiLogicWorld(World):
                     gates = location_req_counts.get(ep.location, Counter())
                     pathless_endpoints[player][ep] = {item for item, count in gates.items()
                                                       if not is_path_member(item, count)}
-        if cls.dump_profile_reference:
+        if run_dir and cls.dump_profile_reference:
             reference = {}
             for player in all_players:
                 world = multiworld.worlds[player]
@@ -1118,7 +1246,7 @@ class ArchiLogicWorld(World):
                 json.dump(reference, f, indent=2)
             logging.info("Wrote %s", reference_path)
 
-        if cls.build_item_requirements:
+        if run_dir and cls.build_item_requirements:
             def item_key(item: Item) -> str:
                 return f"{item.name} (P{item.player})"
 
@@ -1142,7 +1270,7 @@ class ArchiLogicWorld(World):
             logging.info("Wrote %s (%d bytes)", requirements_path,
                          os.path.getsize(requirements_path))
 
-        if cls.dump_paths:
+        if run_dir and cls.dump_paths:
             dump = {}
             for player, endpoints in paths.items():
                 dump[str(player)] = {
@@ -1172,7 +1300,7 @@ class ArchiLogicWorld(World):
             dump["_flags"] = {name: getattr(cls, name) for name in
                               ("filter_events", "filter_empty_paths", "filter_other_endpoints",
                                "expand_single_endpoints", "filter_multi_copy_items",
-                               "filter_forced_early", "filter_locks_too_much")}
+                               "filter_bulk_items", "filter_forced_early", "filter_locks_too_much")}
             dump["_thresholds"] = {"bulk_item_threshold": cls.bulk_item_threshold,
                                    "locks_too_much_threshold": cls.locks_too_much_threshold}
             dump["_pathless_endpoints"] = {
@@ -1207,8 +1335,9 @@ class ArchiLogicWorld(World):
             single_paths: Set[SinglePathHint] = field(default_factory=set)
             multi_path: Optional[MultiPathHint] = None
 
-        hint_sets: Dict[Item, HintSet] = {}
-        for item, endpoints in items_to_paths.items():
+        hint_sets: Dict[Location, HintSet] = {}
+        for holder, endpoints in items_to_paths.items():
+            item = holder.item
             if not (
                     cls.create_single_paths or
                     cls.create_multi_paths or
@@ -1219,9 +1348,7 @@ class ArchiLogicWorld(World):
                 break
 
             # Determine how directly we hint the location/item. Can be overridden by profiles.
-            if item.location is None:
-                hint_directness = Directness.Item
-            elif profile_for(multiworld.game[item.location.player]).prefer_loc_over_region:
+            if profile_for(multiworld.game[holder.player]).prefer_loc_over_region:
                 hint_directness = Directness.Location
             else:
                 hint_directness = Directness.Region
@@ -1234,7 +1361,11 @@ class ArchiLogicWorld(World):
                 if not (cls.create_single_paths or cls.create_multi_paths or cls.create_specific_woths):
                     break
 
-                if cls.create_single_paths:
+                # A collectible placement can't path to its own endpoint, but the WOTH hint
+                # below still wants to name the player it serves — so only path hints skip it.
+                circular = collectible_of.get(end) == item
+
+                if cls.create_single_paths and not circular:
                     # Create single-path hint
                     hint_set.single_paths.add(
                         SinglePathHint(
@@ -1244,7 +1375,7 @@ class ArchiLogicWorld(World):
                         )
                     )
 
-                if cls.create_multi_paths:
+                if cls.create_multi_paths and not circular:
                     # Add to dict for multi-path hint
                     endpoints_dict[(end.player, multiworld.player_name[end.player])].add(end)
 
@@ -1253,7 +1384,7 @@ class ArchiLogicWorld(World):
                     path_players.add(end.player)
 
             # Add multipath hint for item
-            if cls.create_multi_paths:
+            if cls.create_multi_paths and endpoints_dict:
                 hint_set.multi_path = MultiPathHint(
                     item,
                     endpoints_dict,
@@ -1277,35 +1408,180 @@ class ArchiLogicWorld(World):
                     len(path_players) == len(all_players),
                 )
 
-            hint_sets[item] = hint_set
+            hint_sets[holder] = hint_set
 
         t8 = time.perf_counter()
 
-        # Now select randomly select which hints go into the pool based on the seed
-        hint_candidates: Dict[int, List[Item]] = defaultdict(list)
-        for item in hint_sets:
-            hint_candidates[item.player].append(item)
-        for items in hint_candidates.values():
-            items.sort(key=lambda i: (i.player, i.name))
+        # Density hints describe an endpoint, not a placement, so they can't be drawn from the
+        # candidate pool — there is nothing to draw. Built up front, spent off the top.
+        addressable = {p: sum(1 for loc in multiworld.get_locations(p)
+                              if isinstance(loc.address, int))
+                       for p in all_players}
+        seed_locations = sum(addressable.values())
+
+        def hintable_regions(player: int) -> Dict[Region, int]:
+            if profile_for(multiworld.game[player]).prefer_loc_over_region:
+                return {}
+            sizes = Counter(loc.parent_region for loc in multiworld.get_locations(player)
+                            if loc.parent_region and isinstance(loc.address, int)
+                            and loc.parent_region.name != "Menu")
+            # One region is the world by another name, so naming it adds nothing.
+            return dict(sizes) if len(sizes) > 1 else {}
+
+        def density_hints_for(endpoint, collectible: Item) -> List[DensityHint]:
+            needed = profile_reqs.get(endpoint, Counter()).get(collectible, 1)
+            placements = [loc for loc in multiworld.get_filled_locations()
+                          if (loc.item.name, loc.item.player) == (collectible.name, collectible.player)
+                          and isinstance(loc.address, int)]
+            if not placements or not seed_locations:
+                return []
+            by_world = Counter(loc.player for loc in placements)
+            by_region = Counter(loc.parent_region for loc in placements if loc.parent_region)
+
+            # Counts and absences answer different questions — "go here" and "don't bother" —
+            # and nothing good comes of ranking one against the other. Rank within each shape,
+            # where the comparison is real, then alternate when taking so a pool full of counts
+            # can't starve the prunes. No quality floor: with one area per world there are only
+            # ever a handful of these, and a weak true fact still prunes something.
+            counts: List[Tuple[float, float, DensityHint]] = []
+            absences: List[Tuple[float, DensityHint]] = []
+
+            def consider(player: int, area: Region | None, area_name: str,
+                         area_locations: int, held: int) -> None:
+                # One copy in one area is a placement fact, not a density one, and a location
+                # spoiler besides — the WOTHs cover that properly. Without this the narrowness
+                # tiebreak below floats every single-copy grotto to the top of the count list.
+                if held == 1:
+                    return
+                hint = DensityHint(collectible, player, area, area_name, held)
+                if held:
+                    # Narrowness breaks ties: the same count in a smaller haystack is better.
+                    counts.append((held / needed, area_locations / seed_locations, hint))
+                else:
+                    absences.append((area_locations / seed_locations, hint))
+
+            for player in all_players:
+                regions = hintable_regions(player)
+                if not regions:
+                    # One claim for the whole world, and only one shape can ever apply.
+                    consider(player, None, multiworld.player_name[player],
+                             addressable[player], by_world.get(player, 0))
+                    continue
+                for region, size in regions.items():
+                    consider(player, region, get_display_name(region), size,
+                             by_region.get(region, 0))
+
+            counts.sort(key=lambda row: (-row[0], row[1]))
+            absences.sort(key=lambda row: -row[0])
+            ordered = [hint for pair in itertools.zip_longest(
+                [row[-1] for row in counts], [row[-1] for row in absences])
+                for hint in pair if hint is not None]
+            logging.debug("P%d density pool for %s: %d counts, %d absences",
+                          collectible.player, get_display_name(endpoint), len(counts), len(absences))
+            return ordered
+
+        density_by_endpoint = {endpoint: density_hints_for(endpoint, collectible)
+                               for endpoint, collectible in collectible_of.items()}
+
+        # Now select which hints go into the pool. The budget belongs to the game whose endpoint
+        # the path serves, not the world the items sit in: Jigsaw's path is built almost entirely
+        # out of Refunct items, and it is still Jigsaw's path.
+        path_candidates: Dict[int, Dict[Item, List[Location]]] = defaultdict(lambda: defaultdict(list))
+        for holder, endpoints in items_to_paths.items():
+            for endpoint in endpoints:
+                path_candidates[endpoint.player][endpoint].append(holder)
+
+        def pick_hint(hint_set, want_multi: bool):
+            """Whatever this placement can actually produce, preferring the type asked for. The
+            old positional split picked a type first and dropped the slot when the placement had
+            none of it — which is exactly what the circular rule does to collectible members."""
+            if want_multi and hint_set.multi_path:
+                return hint_set.multi_path
+            if hint_set.specific_woth:
+                return hint_set.specific_woth
+            return hint_set.multi_path
+
+        # Claimed across every player, not per player: one placement can sit on paths belonging
+        # to different games, and its multi-path hint already names all of them. Hinting it twice
+        # would be the same sentence billed to two budgets.
+        taken: Set[Location] = set()
 
         selected_hints = []
         for player in all_players:
-            selected_items = archilogic_world.random.sample(
-                hint_candidates[player], min(len(hint_candidates[player]), cls.hints_per_player))
+            by_endpoint = path_candidates.get(player)
+            if not by_endpoint:
+                continue
 
-            # For now I'm just going 2/3rds of hints are multipath, remaining are specific woth
-            multipath_num = math.ceil(len(selected_items) * 2 / 3)
-            woth_num = len(selected_items) - multipath_num
+            # Sorted first so the shuffle is reproducible, then shuffled so round one isn't
+            # ordered by name — that order decides who gets first pick of a shared member.
+            endpoints = sorted(by_endpoint, key=lambda e: (e.player, e.name))
+            archilogic_world.random.shuffle(endpoints)
+
+            pools = {}
+            for endpoint in endpoints:
+                pool = sorted(by_endpoint[endpoint], key=lambda loc: (loc.player, loc.name))
+                archilogic_world.random.shuffle(pool)
+                pools[endpoint] = pool
+
+            # A collectible path is always the longest — "collect 33 of 37" needs most of the
+            # multiworld — so once its siblings run dry it would take every leftover turn. Cap it
+            # then. A game whose only paths are collectible has no siblings to protect, so it
+            # spends the full budget: mostly WOTHs, plus whatever density hints it supports.
+            capped = any(e not in collectible_of for e in endpoints)
+            turns_left = {e: (cls.collectible_path_hints
+                              if capped and e in collectible_of else cls.hints_per_player)
+                          for e in endpoints}
 
             player_hints = []
-            for item in selected_items:
-                hint_set = hint_sets[item]
-                if multipath_num > 0 and hint_set.multi_path:
-                    player_hints.append(hint_set.multi_path)
-                    multipath_num -= 1
-                elif woth_num > 0 and hint_set.specific_woth:
-                    player_hints.append(hint_set.specific_woth)
-                    woth_num -= 1
+            budget = cls.hints_per_player
+
+            # Spent off the top: for a collectible path this is the strongest thing it has, and
+            # the round-robin below can only produce per-placement hints. Taken as a share of
+            # the path's own allowance rather than a flat count, so it can't crowd out the
+            # placement hints — a capped collectible path has three turns in total and
+            # shouldn't spend them all narrating where the collectible sits.
+            for endpoint in endpoints:
+                allowance = max(1, int(turns_left[endpoint] * cls.density_share))
+                for hint in density_by_endpoint.get(endpoint, [])[:allowance]:
+                    if budget <= 0 or turns_left[endpoint] <= 0:
+                        break
+                    hint.for_player = player
+                    player_hints.append(hint)
+                    turns_left[endpoint] -= 1
+                    budget -= 1
+                    logging.info("P%d density: %s", player, hint.hint_text)
+
+            progress = True
+            # Round one guarantees every path a hint. Every pass after is the same round-robin,
+            # so a path with more left to find keeps drawing once the short ones have run dry —
+            # longer paths earn more hints without needing an explicit proportionality rule.
+            while budget > 0 and progress:
+                progress = False
+                for endpoint in endpoints:
+                    if budget <= 0:
+                        break
+                    if turns_left[endpoint] <= 0:
+                        continue
+                    pool = pools[endpoint]
+                    # Paths share members — Refunct's two paths hold 28 slots between them but
+                    # only 16 distinct items — so drop anything another path already claimed.
+                    while pool and pool[-1] in taken:
+                        pool.pop()
+                    if not pool:
+                        continue
+                    holder = pool.pop()
+                    share = (cls.collectible_multi_path_share if endpoint in collectible_of
+                             else cls.multi_path_share)
+                    hint = pick_hint(hint_sets[holder],
+                                     archilogic_world.random.random() < share)
+                    if hint is None:
+                        continue
+                    taken.add(holder)
+                    hint.for_player = player
+                    turns_left[endpoint] -= 1
+                    budget -= 1
+                    player_hints.append(hint)
+                    progress = True
 
             # Do a seeded random shuffle so the hints aren't ordered by type
             archilogic_world.random.shuffle(player_hints)
@@ -1323,6 +1599,16 @@ class ArchiLogicWorld(World):
                              if isinstance(loc.address, int))
             for player in all_players
         }
+
+        # Every endpoint in the seed, not only the ones that reached a granted path hint.
+        # /list_endpoints has to answer on turn one — a player can't target a name they've
+        # never been shown. flatten_item so these read the same as the names the path hints
+        # print, and the ones location_graph stores for the target lookup.
+        archilogic_world.endpoints = [
+            flatten_item(endpoint)
+            for player in sorted(player_endpoints)
+            for endpoint in sorted(player_endpoints[player], key=get_display_name)
+        ]
 
         if cls.build_item_requirements:
             # Display names are the only names the client ever sees, so two distinct
@@ -1366,8 +1652,9 @@ class ArchiLogicWorld(World):
                     "sphere": len(collection_spheres),
                     "address": None,
                     "item": [endpoint.name, endpoint.player],
-                    "requires": [[get_display_name(req), req.player, 1]
-                                 for req in sorted(reqs, key=lambda i: (i.player, i.name))],
+                    "requires": [[get_display_name(req), req.player, count]
+                                 for req, count in sorted(reqs.items(),
+                                                          key=lambda kv: (kv[0].player, kv[0].name))],
                 }
                 for endpoint, reqs in sorted(profile_reqs.items(), key=lambda kv: (kv[0].player, kv[0].name))
             )
@@ -1390,5 +1677,6 @@ class ArchiLogicWorld(World):
                      len({i.location for p in paths.values() for path in p.values()
                           for i in path if i.location in either_or_locs}))
 
-        logging.getLogger().removeHandler(run_log)
-        run_log.close()
+        if run_dir:
+            logging.getLogger().removeHandler(run_log)
+            run_log.close()
